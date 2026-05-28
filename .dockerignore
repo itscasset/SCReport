@@ -1,0 +1,31 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Git and editor
+.git/
+.gitignore
+.vscode/
+.idea/
+
+# Local reports/artifacts
+*.xlsx
+/tmp/
+
+# Test/cache output
+.pytest_cache/
+.mypy_cache/
+.coverage
+
+# Secrets and env files
+.env
+.env.*
+
+# OS files
+.DS_Store
+Thumbs.db
