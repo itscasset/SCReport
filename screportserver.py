@@ -1,10 +1,10 @@
-import os
 import re
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from google.cloud import bigquery
@@ -31,12 +31,19 @@ mcp = FastMCP(
 # --------------------------------------------------------
 # Config
 # --------------------------------------------------------
-PROJECT_ID = os.getenv("GCP_PROJECT_ID", "sc-ai-uat")
-DATASET_ID = os.getenv("BQ_DATASET_ID", "SCReport")
-AUTH_TABLE = os.getenv("BQ_AUTH_TABLE", "AuthenByMenu")
+PROJECT_ID = "sc-ai-uat"
+DATASET_ID = "SCReport"
+AUTH_TABLE = "AuthenByMenu"
+DEFAULT_USER_EMAIL = "test_user@scasset.com"
+PUBLIC_BASE_URL = ""
 
 REPORT_DIR = Path("/tmp/reports")
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+CURRENT_REQUEST_USER_EMAIL: ContextVar[Optional[str]] = ContextVar(
+    "current_request_user_email",
+    default=None,
+)
 
 class GenerateReportRequest(BaseModel):
     table_id: str
@@ -45,6 +52,17 @@ class GenerateReportRequest(BaseModel):
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "sc-report-api-mcp"}
+
+
+@app.middleware("http")
+async def capture_user_email_header(request: Request, call_next):
+    # Header from LibreChat is expected as X-User-Email
+    token = CURRENT_REQUEST_USER_EMAIL.set(request.headers.get("x-user-email"))
+    try:
+        response = await call_next(request)
+    finally:
+        CURRENT_REQUEST_USER_EMAIL.reset(token)
+    return response
 
 def validate_table_id(table_id: str) -> bool:
     return bool(re.match(r"^[A-Za-z0-9_]+$", table_id))
@@ -87,7 +105,7 @@ def check_user_permission(email: str, table_id: str):
     description="ดึงข้อมูลรายงานจาก BigQuery โดยจะเช็คสิทธิ์ผู้ใช้งานจากตาราง AuthenByMenu อัตโนมัติก่อนสร้างไฟล์ Excel",
 )
 def mcp_generate_excel_report(table_id: str) -> str:
-    user_email = os.getenv("CURRENT_USER_EMAIL", "test_user@scasset.com")
+    user_email = CURRENT_REQUEST_USER_EMAIL.get() or DEFAULT_USER_EMAIL
 
     if not validate_table_id(table_id):
         return "❌ table_id ไม่ถูกต้อง"
@@ -112,7 +130,7 @@ def mcp_generate_excel_report(table_id: str) -> str:
         file_path = REPORT_DIR / file_name
         df.to_excel(file_path, index=False)
 
-        base_url = os.getenv("PUBLIC_BASE_URL", "")
+        base_url = PUBLIC_BASE_URL
         download_url = f"{base_url.rstrip()}/download/{file_name}" if base_url else f"/download/{file_name}"
 
         return (
@@ -144,10 +162,10 @@ async def shutdown_event():
 # REST API (คงไว้เผื่อฝั่งอื่นจะยิงเรียกใช้แบบเดิม)
 # --------------------------------------------------------
 @app.post("/generate_excel_report")
-def generate_excel_report(request: GenerateReportRequest):
+def generate_excel_report(request: GenerateReportRequest, http_request: Request):
     # ... (Logic ตัวเดิมที่คุณส่งมาทั้งหมด ยกมาทำงานได้ตามปกติ 100% เลยครับ) ...
     table_id = request.table_id
-    user_email = request.user_email or os.getenv("CURRENT_USER_EMAIL") or "test_user@scasset.com"
+    user_email = request.user_email or http_request.headers.get("x-user-email") or DEFAULT_USER_EMAIL
     if not validate_table_id(table_id): return {"success": False, "message": "❌ table_id ไม่ถูกต้อง"}
     report_name = check_user_permission(user_email, table_id)
     if not report_name: return {"success": False, "message": f"🙏 ขออภัย... ดูข้อมูลเพิ่มเติมที่ sc system"}
@@ -157,7 +175,7 @@ def generate_excel_report(request: GenerateReportRequest):
         if df.empty: return {"success": False, "message": f"❌ ไม่พบข้อมูล"}
         file_name = f"Report_{table_id}.xlsx"
         df.to_excel(REPORT_DIR / file_name, index=False)
-        base_url = os.getenv("PUBLIC_BASE_URL", "")
+        base_url = PUBLIC_BASE_URL
         download_url = f"{base_url.rstrip()}/download/{file_name}" if base_url else f"/download/{file_name}"
         return {"success": True, "message": f"✅ จัดเตรียม **รายงาน{report_name}** สำเร็จ\n🔗 {download_url}"}
     except Exception as e: return {"success": False, "message": f"🚨 เกิดข้อผิดพลาด: {str(e)}"}
