@@ -12,6 +12,4 @@ COPY screportserver.py .
 # 4. เปิดพอร์ต 8080 มาตรฐานสำหรับ Google Cloud Run
 EXPOSE 8080
 # 5. สั่งสตาร์ท FastAPI ด้วย Uvicorn โดยใช้ PORT จาก Cloud Run
-# CMD ["sh", "-c", "uvicorn screportserver:app --host 0.0.0.0 --port ${PORT:-8080}"]
-# 🎯 แก้ไขบรรทัดที่ 5: ปรับรูปแบบให้ยิงตรงหา Uvicorn แบบไม่ผ่าน shell เปลือกนอก
-CMD ["uvicorn", "screportserver:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["sh", "-c", "uvicorn screportserver:app --host 0.0.0.0 --port ${PORT:-8080}"]
