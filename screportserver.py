@@ -68,7 +68,9 @@ def health():
 
 @app.middleware("http")
 async def capture_user_email_header(request: Request, call_next):
-    token = CURRENT_REQUEST_USER_EMAIL.set(request.headers.get("x-user-email"))
+    # ดึงค่าจาก Header ตรงๆ
+    email = request.headers.get("x-user-email") or DEFAULT_USER_EMAIL
+    token = CURRENT_REQUEST_USER_EMAIL.set(email) # เก็บค่าลง ContextVar
     try:
         response = await call_next(request)
     finally:
@@ -131,15 +133,30 @@ def check_user_permission(email: str, table_id: str):
         return None
 
 # ♻️ Helper Function ดึงข้อมูลและสร้างไฟล์ Excel
-def fetch_and_generate_excel(table_id: str) -> Optional[pd.DataFrame]:
-    query = f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.{table_id}` LIMIT 2000"
-    df = bq_client.query(query).to_dataframe()
-    if df.empty:
-        return None
+def fetch_and_generate_excel(table_id: str, where_clause: str = "") -> Optional[pd.DataFrame]:
+    # ดึงชื่อตารางท้ายสุด (เช่น VRptExpension)
+    clean_table_id = table_id.split('.')[-1]
+    
+    try:
+        # สร้าง SQL โดยใส่ WHERE clause ถ้ามีการส่งมา
+        sql_where = f"WHERE {where_clause}" if where_clause else ""
+        query = f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.{clean_table_id}` {sql_where} LIMIT 5000"
+        
+        df = bq_client.query(query).to_dataframe()
+        
+        if df.empty:
+            return None
 
-    file_path = REPORT_DIR / f"Report_{table_id}.xlsx"
-    df.to_excel(file_path, index=False)
-    return df
+        # ตั้งชื่อไฟล์โดยใช้ clean_table_id เพื่อความปลอดภัยของระบบไฟล์
+        file_name = f"Report_{clean_table_id}.xlsx"
+        file_path = REPORT_DIR / file_name
+        
+        df.to_excel(file_path, index=False)
+        return df
+
+    except Exception as e:
+        print(f"🚨 Error: {str(e)}")
+        return None
 
 # --------------------------------------------------------
 # 🛠️ MCP Server (Streamable HTTP — stateless)
@@ -157,38 +174,35 @@ mcp = FastMCP(
     name="generate_excel_report",
     description="ดึงข้อมูลรายงานจาก BigQuery โดยจะเช็คสิทธิ์ผู้ใช้งานจากตาราง AuthenByMenu อัตโนมัติก่อนสร้างไฟล์ Excel",
 )
-def mcp_generate_excel_report(table_id: str, user_email: str = None) -> str:
-    # 1. ถ้าไม่ได้ส่งมา ให้ลองดึงจาก Context ถ้าไม่มีจริงๆ ค่อยใช้ Default
+def mcp_generate_excel_report(table_id: str, filter_condition: str = None, user_email: str = None) -> str:
+    # 1. จัดการเรื่อง Email และ Table ID
     email = user_email or CURRENT_REQUEST_USER_EMAIL.get() or DEFAULT_USER_EMAIL
-    
-    print(f"DEBUG: Using Email -> {email}") # ตรวจสอบใน Logs ว่าค่านี้คืออะไร
+    clean_table_id = table_id.split('.')[-1]
 
-    if not validate_table_id(table_id):
-        return "❌ table_id ไม่ถูกต้อง"
+    if not validate_table_id(clean_table_id):
+        return f"❌ table_id '{clean_table_id}' ไม่ถูกต้อง"
 
-    # 2. ส่ง email ที่ดึงได้เข้าไปเช็คสิทธิ์
-    report_name = check_user_permission(email, table_id)
-    
+    # 2. เช็คสิทธิ์ (ใช้ clean_table_id เพื่อให้ตรงกับใน DB AuthenByMenu)
+    report_name = check_user_permission(email, clean_table_id)
     if not report_name:
-        return (
-            f"🙏 ขออภัยในความไม่สะดวกครับคุณ {email} "
-            "เนื่องจากระบบตรวจสอบพบว่าคุณยังไม่มีสิทธิ์เข้าถึงรายงานตัวนี้..."
-        )
+        return f"🙏 ขออภัยคุณ {email} ระบบตรวจสอบพบว่าคุณยังไม่มีสิทธิ์เข้าถึงรายงานนี้"
 
     try:
-        df = fetch_and_generate_excel(table_id)
+        # 3. เรียก fetch โดยส่ง filter_condition เข้าไปด้วย (ถ้า AI วิเคราะห์มาให้)
+        df = fetch_and_generate_excel(clean_table_id, where_clause=filter_condition)
+        
         if df is None:
-            return f"❌ ไม่พบข้อมูลในรายงาน {report_name}"
+            return f"❌ ไม่พบข้อมูลในรายงาน {report_name} " + (f"ตามเงื่อนไขที่ระบุ" if filter_condition else "")
 
-        file_name = f"Report_{table_id}.xlsx"
-        base_url = PUBLIC_BASE_URL
-        download_url = f"{base_url.rstrip('/')}/download/{file_name}" if base_url else f"/download/{file_name}"
+        # 4. สร้าง Link ดาวน์โหลด (ใช้ clean_table_id ให้ตรงกับชื่อไฟล์ที่บันทึก)
+        file_name = f"Report_{clean_table_id}.xlsx"
+        download_url = f"{PUBLIC_BASE_URL.rstrip('/')}/download/{file_name}"
 
         return (
-            "✅ ตรวจสอบสิทธิ์ผ่านระบบ AuthenByMenu เรียบร้อยแล้วครับ\n"
-            f"📊 ระบบได้จัดเตรียม **รายงาน{report_name}** จำนวนทั้งหมด {len(df)} แถวให้คุณเรียบร้อยแล้ว\n\n"
-            "📥 **คลิกลิงก์เพื่อดาวน์โหลดไฟล์ลงเครื่อง:**\n"
-            f"🔗 {download_url}"
+            f"✅ ระบบตรวจสอบสิทธิ์เรียบร้อยแล้ว\n"
+            f"📊 ได้จัดเตรียม **รายงาน{report_name}** จำนวน {len(df)} แถว\n"
+            f"💡 เงื่อนไขที่ใช้: {'ทั้งหมด' if not filter_condition else filter_condition}\n\n"
+            f"📥 **ดาวน์โหลดที่นี่:**\n🔗 {download_url}"
         )
     except Exception as e:
         return f"🚨 เกิดข้อผิดพลาด: {str(e)}"
