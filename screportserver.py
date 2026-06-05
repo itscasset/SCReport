@@ -1,4 +1,5 @@
 import re
+import os
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Optional
@@ -12,6 +13,8 @@ from google.cloud import bigquery
 # 📦 MCP FastMCP สำหรับ Streamable HTTP
 from mcp.server.fastmcp import FastMCP
 
+from fastapi.middleware.cors import CORSMiddleware
+
 # --------------------------------------------------------
 # FastAPI App
 # --------------------------------------------------------
@@ -21,11 +24,13 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# 🛠️ 1. ลงทะเบียน MCP Server แบบ Streamable HTTP
-mcp = FastMCP(
-    "sc-report-server",
-    stateless_http=True,
-    json_response=True,
+# เพิ่ม CORS Middleware เพื่อให้เว็บ Tantawan เรียกใช้งานได้
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # --------------------------------------------------------
@@ -37,8 +42,12 @@ AUTH_TABLE = "AuthenByMenu"
 DEFAULT_USER_EMAIL = "test_user@scasset.com"
 PUBLIC_BASE_URL = ""
 
-REPORT_DIR = Path("/tmp/reports")
+# กำหนด Path และทำให้แน่ใจว่าเป็  น absolute path
+REPORT_DIR = Path("/tmp/reports").resolve()
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ⚡ ประกาศสร้าง Client เป็น Global เพื่อแชร์การเชื่อมต่อร่วมกัน
+bq_client = bigquery.Client(project=PROJECT_ID)
 
 CURRENT_REQUEST_USER_EMAIL: ContextVar[Optional[str]] = ContextVar(
     "current_request_user_email",
@@ -49,14 +58,16 @@ class GenerateReportRequest(BaseModel):
     table_id: str
     user_email: Optional[str] = None
 
+@app.get("/")
+def read_root():
+    return {"message": "Welcome to SC Report API. MCP server is active at /mcp"}
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "sc-report-api-mcp"}
 
-
 @app.middleware("http")
 async def capture_user_email_header(request: Request, call_next):
-    # Header from LibreChat is expected as X-User-Email
     token = CURRENT_REQUEST_USER_EMAIL.set(request.headers.get("x-user-email"))
     try:
         response = await call_next(request)
@@ -67,38 +78,80 @@ async def capture_user_email_header(request: Request, call_next):
 def validate_table_id(table_id: str) -> bool:
     return bool(re.match(r"^[A-Za-z0-9_]+$", table_id))
 
-# --------------------------------------------------------
-# Authen Function (โครงสร้างเดิมของพี่หนุ่ย แนะนำปรับ WHERE ตามตารางจริง)
-# --------------------------------------------------------
+# 🛡️ ตรวจสอบสิทธิ์โดยใช้ Global Client
 def check_user_permission(email: str, table_id: str):
     print(f"🔍 [Authentication] ตรวจสอบสิทธิ์: {email} สำหรับตาราง: {table_id}")
+    
+    # 1. Mapping table_id (ชื่อจริงใน DB) ให้เป็น ReportName (ชื่อในตารางสิทธิ์)
+    # ใช้ตัวเล็ก (lower) เพื่อลดความผิดพลาดในการเปรียบเทียบ
+    mapping = {
+        "vrptexpension": "รายงานตรวจสอบการจ่ายเงิน(ต้นทุน)",
+        "vrptexpensionexpmodule": "รายงานตรวจสอบการจ่ายเงิน (ค่าใช้จ่าย)",
+        "authenbymenu": "ข้อมูลสิทธิ์"
+    }
+    
+    # Clean table_id: เอาแค่ชื่อตารางท้ายสุด และทำเป็นตัวเล็ก
+    clean_table_id = table_id.split('.')[-1].lower()
+    report_name = mapping.get(clean_table_id)
+    
+    # ถ้าไม่มีใน Mapping แสดงว่าไม่ใช่ตารางที่เราอนุญาตให้ Gen Excel
+    if not report_name:
+        print(f"🚨 [Error] ไม่พบ Mapping สำหรับตาราง: {clean_table_id}")
+        return None
+
     try:
-        client = bigquery.Client(project=PROJECT_ID)
-        
-        # 🎯 ปรับแต่งเพิ่มเงื่อนไขตรวจเช็คคู่กับ TableName ในตาราง AuthenByMenu เพื่อความปลอดภัย
+        # 2. ใช้ Query Parameters เหมือนของเดิมเพื่อความปลอดภัย (SQL Injection Prevention)
+        # และใช้ TRIM() เพื่อดักช่องว่างในฐานข้อมูล
         auth_query = f"""
             SELECT ReportName
             FROM `{PROJECT_ID}.{DATASET_ID}.{AUTH_TABLE}`
-            WHERE Email = @email AND TableName = @table_id
+            WHERE TRIM(Email) = @email 
+            AND TRIM(ReportName) = @report_name
             LIMIT 1
         """
+        
         job_config = bigquery.QueryJobConfig(
             query_parameters=[
-                bigquery.ScalarQueryParameter("email", "STRING", email),
-                bigquery.ScalarQueryParameter("table_id", "STRING", table_id),
+                bigquery.ScalarQueryParameter("email", "STRING", email.strip()),
+                bigquery.ScalarQueryParameter("report_name", "STRING", report_name),
             ]
         )
-        auth_df = client.query(auth_query, job_config=job_config).to_dataframe()
+        
+        auth_df = bq_client.query(auth_query, job_config=job_config).to_dataframe()
+        
         if not auth_df.empty:
-            return auth_df["ReportName"].iloc[0]
+            print(f"✅ [Success] พบสิทธิ์: {report_name}")
+            return report_name # คืนค่าชื่อรายงานกลับไปใช้แสดงผล
+            
+        print(f"❌ [Denied] ไม่พบสิทธิ์สำหรับ Email: {email} ในรายงาน: {report_name}")
         return None
+        
     except Exception as auth_error:
-        print(f"🚨 ไม่สามารถตรวจสอบสิทธิ์กับ BigQuery ได้: {str(auth_error)}")
+        print(f"🚨 [System Error] ไม่สามารถตรวจสอบสิทธิ์ได้: {str(auth_error)}")
         return None
 
+# ♻️ Helper Function ดึงข้อมูลและสร้างไฟล์ Excel
+def fetch_and_generate_excel(table_id: str) -> Optional[pd.DataFrame]:
+    query = f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.{table_id}` LIMIT 2000"
+    df = bq_client.query(query).to_dataframe()
+    if df.empty:
+        return None
+
+    file_path = REPORT_DIR / f"Report_{table_id}.xlsx"
+    df.to_excel(file_path, index=False)
+    return df
+
 # --------------------------------------------------------
-# 🌐 ส่วนเสริม: MCP Server Interface (Streamable HTTP)
+# 🛠️ MCP Server (Streamable HTTP — stateless)
 # --------------------------------------------------------
+
+# FIX: stateless_http=True ไม่ต้องการ session manager lifecycle
+mcp = FastMCP(
+    "sc-report-server",
+    stateless_http=True,
+    json_response=True,
+    host="0.0.0.0",
+)
 
 @mcp.tool(
     name="generate_excel_report",
@@ -115,23 +168,17 @@ def mcp_generate_excel_report(table_id: str) -> str:
         return (
             f"🙏 ขออภัยในความไม่สะดวกครับคุณ {user_email.split('@')[0]} "
             "เนื่องจากระบบตรวจสอบพบว่าคุณยังไม่มีสิทธิ์เข้าถึงรายงานตัวนี้ในขณะนี้\n\n"
-            "💡 หากต้องการตรวจสอบหรือดูข้อมูลรายงานเพิ่มเติม สามารถเข้าชมได้ที่ระบบ **sc system** ครับ"
+            "💡 หากต้องการตรวจสอบหรือดูข้อมูลรายงานเพิ่มเติม สามารถเข้าชมได้ที่ระบบ sc system ครับ"
         )
 
     try:
-        client = bigquery.Client(project=PROJECT_ID)
-        query = f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.{table_id}` LIMIT 2000"
-        df = client.query(query).to_dataframe()
-
-        if df.empty:
+        df = fetch_and_generate_excel(table_id)
+        if df is None:
             return f"❌ ไม่พบข้อมูลในรายงาน {report_name}"
 
         file_name = f"Report_{table_id}.xlsx"
-        file_path = REPORT_DIR / file_name
-        df.to_excel(file_path, index=False)
-
         base_url = PUBLIC_BASE_URL
-        download_url = f"{base_url.rstrip()}/download/{file_name}" if base_url else f"/download/{file_name}"
+        download_url = f"{base_url.rstrip('/')}/download/{file_name}" if base_url else f"/download/{file_name}"
 
         return (
             "✅ ตรวจสอบสิทธิ์ผ่านระบบ AuthenByMenu เรียบร้อยแล้วครับ\n"
@@ -142,15 +189,14 @@ def mcp_generate_excel_report(table_id: str) -> str:
     except Exception as e:
         return f"🚨 เกิดข้อผิดพลาด: {str(e)}"
 
-# Mount MCP endpoint เป็น Streamable HTTP ที่ /mcp
-app.mount("/mcp", mcp.streamable_http_app())
-
+# Mount ที่ root ("") เพื่อให้ route ข้างในที่เป็น /mcp ยังคงเป็น /mcp ไม่เบิ้ลเป็น /mcp/mcp
+app.mount("", mcp.streamable_http_app())
 
 @app.on_event("startup")
 async def startup_event():
+    # FastMCP streamable-http จำเป็นต้องรัน session_manager
     app.state.mcp_session_manager_ctx = mcp.session_manager.run()
     await app.state.mcp_session_manager_ctx.__aenter__()
-
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -159,40 +205,77 @@ async def shutdown_event():
         await ctx.__aexit__(None, None, None)
 
 # --------------------------------------------------------
-# REST API (คงไว้เผื่อฝั่งอื่นจะยิงเรียกใช้แบบเดิม)
+# REST API
 # --------------------------------------------------------
 @app.post("/generate_excel_report")
 def generate_excel_report(request: GenerateReportRequest, http_request: Request):
-    # ... (Logic ตัวเดิมที่คุณส่งมาทั้งหมด ยกมาทำงานได้ตามปกติ 100% เลยครับ) ...
-    table_id = request.table_id
-    user_email = request.user_email or http_request.headers.get("x-user-email") or DEFAULT_USER_EMAIL
-    if not validate_table_id(table_id): return {"success": False, "message": "❌ table_id ไม่ถูกต้อง"}
-    report_name = check_user_permission(user_email, table_id)
-    if not report_name: return {"success": False, "message": f"🙏 ขออภัย... ดูข้อมูลเพิ่มเติมที่ sc system"}
+    # 1. จัดการเรื่อง Table ID ให้เป็นมาตรฐานเดียวกัน (Clean Table ID)
+    raw_table_id = request.table_id
+    # ดึงเอาเฉพาะชื่อตารางท้ายสุด เช่น 'VRptExpension'
+    clean_table_id = raw_table_id.split('.')[-1] 
+
+    # 2. ตรวจสอบ Email (เน้น Header ก่อนเสมอ)
+    user_email = http_request.headers.get("x-user-email") or request.user_email or DEFAULT_USER_EMAIL
+
+    # 3. Validation (ควรใช้ clean_table_id ในการเช็ค)
+    if not validate_table_id(clean_table_id):
+        return {"success": False, "message": f"❌ ชื่อตาราง '{clean_table_id}' ไม่ถูกต้องในระบบ"}
+
+    # 4. Check Permission (ส่ง clean_table_id เข้าไปเพื่อให้ Mapping ทำงานได้)
+    report_name = check_user_permission(user_email, clean_table_id)
+    if not report_name:
+        return {
+            "success": False, 
+            "message": f"🙏 ขออภัยคุณ {user_email} ระบบไม่พบสิทธิ์เข้าถึงรายงานนี้ในฐานข้อมูล"
+        }
+
     try:
-        client = bigquery.Client(project=PROJECT_ID)
-        df = client.query(f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.{table_id}` LIMIT 2000").to_dataframe()
-        if df.empty: return {"success": False, "message": f"❌ ไม่พบข้อมูล"}
-        file_name = f"Report_{table_id}.xlsx"
-        df.to_excel(REPORT_DIR / file_name, index=False)
+        # 5. Fetch ข้อมูล (ขั้นตอนนี้อาจจะใช้ raw_table_id หรือ Full Path ตามที่ BigQuery ต้องการ)
+        # แนะนำให้ fetch_and_generate_excel รับ Full Path ได้เพื่อความแม่นยำใน BigQuery
+        full_table_path = f"sc-ai-uat.SCReport.{clean_table_id}"
+        df = fetch_and_generate_excel(full_table_path)
+        
+        if df is None or df.empty:
+            return {"success": False, "message": f"❌ ไม่พบข้อมูลในรายงาน {report_name}"}
+
+        # 6. ตั้งชื่อไฟล์ให้สื่อความหมาย (ใช้ report_name)
+        # ลบช่องว่างหรืออักขระพิเศษในชื่อไฟล์ออก
+        safe_report_name = report_name.replace(" ", "_").replace("(", "").replace(")", "")
+        file_name = f"Report_{safe_report_name}.xlsx"
+        
         base_url = PUBLIC_BASE_URL
-        download_url = f"{base_url.rstrip()}/download/{file_name}" if base_url else f"/download/{file_name}"
-        return {"success": True, "message": f"✅ จัดเตรียม **รายงาน{report_name}** สำเร็จ\n🔗 {download_url}"}
-    except Exception as e: return {"success": False, "message": f"🚨 เกิดข้อผิดพลาด: {str(e)}"}
+        download_url = f"{base_url.rstrip('/')}/download/{file_name}" if base_url else f"/download/{file_name}"
+
+        return {
+            "success": True, 
+            "message": f"✅ จัดเตรียม **{report_name}** สำเร็จแล้วครับ\n🔗 [คลิกที่นี่เพื่อดาวน์โหลดรายงาน]({download_url})"
+        }
+    except Exception as e:
+        print(f"🚨 Error in generate_excel_report: {str(e)}")
+        return {"success": False, "message": f"🚨 เกิดข้อผิดพลาดขณะสร้างไฟล์: {str(e)}"}
 
 # --------------------------------------------------------
-# Download Excel
+# Download Excel (🛡️ ป้องกัน Path Traversal)
 # --------------------------------------------------------
 @app.get("/download/{file_name}")
 def download_report(file_name: str):
     if not file_name.endswith(".xlsx"):
         return {"success": False, "message": "❌ อนุญาตเฉพาะไฟล์ .xlsx เท่านั้น"}
-    file_path = REPORT_DIR / file_name
+
+    file_path = (REPORT_DIR / file_name).resolve()
+
+    if not file_path.is_relative_to(REPORT_DIR):
+        return {"success": False, "message": "❌ ไม่มีสิทธิ์เข้าถึงไฟล์นอกไดเรกทอรีที่กำหนด"}
+
     if not file_path.exists():
         return {"success": False, "message": "❌ ไม่พบไฟล์ที่ต้องการดาวน์โหลด"}
-    return FileResponse(path=file_path, filename=file_name, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    return FileResponse(
+        path=file_path,
+        filename=file_name,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 if __name__ == "__main__":
     import uvicorn
-    # รันบนเครื่องพอร์ต 8080 เป็นหลัก
     uvicorn.run(app, host="0.0.0.0", port=8080)
