@@ -39,7 +39,7 @@ app.add_middleware(
 PROJECT_ID = "sc-ai-uat"
 DATASET_ID = "SCReport"
 AUTH_TABLE = "AuthenByMenu"
-DEFAULT_USER_EMAIL = "test_user@scasset.com"
+DEFAULT_USER_EMAIL = "kachatharn@scasset.com"
 PUBLIC_BASE_URL = ""
 
 # กำหนด Path และทำให้แน่ใจว่าเป็  น absolute path
@@ -105,14 +105,14 @@ def check_user_permission(email: str, table_id: str):
         auth_query = f"""
             SELECT ReportName
             FROM `{PROJECT_ID}.{DATASET_ID}.{AUTH_TABLE}`
-            WHERE TRIM(Email) = @email 
+            WHERE LOWER(TRIM(Email)) = LOWER(@email) 
             AND TRIM(ReportName) = @report_name
             LIMIT 1
         """
         
         job_config = bigquery.QueryJobConfig(
             query_parameters=[
-                bigquery.ScalarQueryParameter("email", "STRING", email.strip()),
+                bigquery.ScalarQueryParameter("email", "STRING", email.lower().strip()),
                 bigquery.ScalarQueryParameter("report_name", "STRING", report_name),
             ]
         )
@@ -157,18 +157,22 @@ mcp = FastMCP(
     name="generate_excel_report",
     description="ดึงข้อมูลรายงานจาก BigQuery โดยจะเช็คสิทธิ์ผู้ใช้งานจากตาราง AuthenByMenu อัตโนมัติก่อนสร้างไฟล์ Excel",
 )
-def mcp_generate_excel_report(table_id: str) -> str:
-    user_email = CURRENT_REQUEST_USER_EMAIL.get() or DEFAULT_USER_EMAIL
+def mcp_generate_excel_report(table_id: str, user_email: str = None) -> str:
+    # 1. ถ้าไม่ได้ส่งมา ให้ลองดึงจาก Context ถ้าไม่มีจริงๆ ค่อยใช้ Default
+    email = user_email or CURRENT_REQUEST_USER_EMAIL.get() or DEFAULT_USER_EMAIL
+    
+    print(f"DEBUG: Using Email -> {email}") # ตรวจสอบใน Logs ว่าค่านี้คืออะไร
 
     if not validate_table_id(table_id):
         return "❌ table_id ไม่ถูกต้อง"
 
-    report_name = check_user_permission(user_email, table_id)
+    # 2. ส่ง email ที่ดึงได้เข้าไปเช็คสิทธิ์
+    report_name = check_user_permission(email, table_id)
+    
     if not report_name:
         return (
-            f"🙏 ขออภัยในความไม่สะดวกครับคุณ {user_email.split('@')[0]} "
-            "เนื่องจากระบบตรวจสอบพบว่าคุณยังไม่มีสิทธิ์เข้าถึงรายงานตัวนี้ในขณะนี้\n\n"
-            "💡 หากต้องการตรวจสอบหรือดูข้อมูลรายงานเพิ่มเติม สามารถเข้าชมได้ที่ระบบ sc system ครับ"
+            f"🙏 ขออภัยในความไม่สะดวกครับคุณ {email} "
+            "เนื่องจากระบบตรวจสอบพบว่าคุณยังไม่มีสิทธิ์เข้าถึงรายงานตัวนี้..."
         )
 
     try:
