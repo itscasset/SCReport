@@ -30,7 +30,7 @@ app.add_middleware(
 )
 
 # --------------------------------------------------------
-# Config (จากโค้ดเดิม)
+# Config
 # --------------------------------------------------------
 PROJECT_ID = "sc-ai-uat"
 DATASET_ID = "SCReport"
@@ -86,11 +86,18 @@ async def capture_user_email_header(request: Request, call_next):
 # --------------------------------------------------------
 # Helpers
 # --------------------------------------------------------
+def clean_table_id(raw: str) -> str:
+    """ทำความสะอาด table_id — ลบ backtick, project/dataset prefix, และ whitespace"""
+    return raw.strip().strip("`").split(".")[-1].strip()
+
 def validate_table_id(table_id: str) -> bool:
     return bool(re.match(r"^[A-Za-z0-9_]+$", table_id))
 
+def is_valid_email(email: str) -> bool:
+    """กรอง literal template string เช่น ${user.email} ออก"""
+    return bool(re.match(r"^[^@${}]+@[^@${}]+\.[^@${}]+$", email))
 
-# Mapping table_id → ชื่อรายงานที่อาจเก็บใน DB ทั้ง 2 รูปแบบ (จากโค้ดเดิม)
+# Mapping table_id → ชื่อรายงาน รองรับทั้ง 2 รูปแบบ (มีเว้นวรรค / ไม่มี)
 TABLE_TO_REPORT_NAMES: dict[str, list[str]] = {
     "vrptexpension": [
         "รายงานตรวจสอบการจ่ายเงิน (ต้นทุน)",
@@ -105,7 +112,7 @@ TABLE_TO_REPORT_NAMES: dict[str, list[str]] = {
 
 def check_user_permission(email: str, table_id: str) -> Optional[str]:
     """ตรวจสอบสิทธิ์ผู้ใช้จากตาราง AuthenByMenu ใน BigQuery"""
-    clean = table_id.split(".")[-1].lower()
+    clean = table_id.lower()
     report_names = TABLE_TO_REPORT_NAMES.get(clean)
 
     if not report_names:
@@ -143,21 +150,20 @@ def check_user_permission(email: str, table_id: str) -> Optional[str]:
 
 
 def fetch_and_generate_excel(table_id: str) -> Optional[pd.DataFrame]:
-    """ดึงข้อมูลจาก BigQuery และบันทึกเป็น Excel (จากโค้ดเดิม)"""
-    clean_table_id = table_id.split(".")[-1]
-    query = f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.{clean_table_id}` LIMIT 2000"
+    """ดึงข้อมูลจาก BigQuery และบันทึกเป็น Excel"""
+    query = f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.{table_id}` LIMIT 2000"
     df = bq_client.query(query).to_dataframe()
     if df.empty:
         return None
     # Strip timezone จาก datetime columns (Excel ไม่รองรับ timezone-aware)
     for col in df.select_dtypes(include=["datetimetz"]).columns:
         df[col] = df[col].dt.tz_localize(None)
-    file_path = REPORT_DIR / f"Report_{clean_table_id}.xlsx"
+    file_path = REPORT_DIR / f"Report_{table_id}.xlsx"
     df.to_excel(file_path, index=False)
     return df
 
 # --------------------------------------------------------
-# MCP Server (การเชื่อมต่อจากโค้ดที่เชื่อมได้)
+# MCP Server
 # --------------------------------------------------------
 mcp = FastMCP(
     "sc-report-server",
@@ -168,28 +174,45 @@ mcp = FastMCP(
 
 @mcp.tool(
     name="generate_excel_report",
-    description="ดึงข้อมูลรายงานจาก BigQuery โดยจะเช็คสิทธิ์ผู้ใช้งานจากตาราง AuthenByMenu อัตโนมัติก่อนสร้างไฟล์ Excel",
+    description=(
+        "ดึงข้อมูลรายงานจาก BigQuery และสร้างไฟล์ Excel ให้ดาวน์โหลด "
+        "โดยตรวจสอบสิทธิ์ผู้ใช้จากตาราง AuthenByMenu อัตโนมัติ "
+        "table_id ที่รองรับ: vrptexpension, vrptexpensionexpmodule "
+        "user_email ต้องเป็น email จริงเท่านั้น เช่น name@scasset.com"
+    ),
 )
-def mcp_generate_excel_report(table_id: str) -> str:
-    user_email = CURRENT_REQUEST_USER_EMAIL.get() or DEFAULT_USER_EMAIL
+def mcp_generate_excel_report(table_id: str, user_email: str) -> str:
+    # 1. Clean table_id — ลบ backtick, project/dataset prefix
+    tid = clean_table_id(table_id)
+    print(f"📋 [MCP] table_id raw='{table_id}' → clean='{tid}'")
 
-    if not validate_table_id(table_id):
-        return "❌ table_id ไม่ถูกต้อง"
+    if not validate_table_id(tid):
+        return (
+            f"❌ table_id '{tid}' ไม่ถูกต้อง\n"
+            "กรุณาระบุชื่อตารางเป็นภาษาอังกฤษและตัวเลขเท่านั้น เช่น vrptexpension"
+        )
 
-    report_name = check_user_permission(user_email, table_id)
+    # 2. Resolve email — กรอง ${user.email} literal ออก
+    email = user_email if is_valid_email(user_email) else None
+    email = email or CURRENT_REQUEST_USER_EMAIL.get() or DEFAULT_USER_EMAIL
+    print(f"👤 [MCP] user_email raw='{user_email}' → resolved='{email}'")
+
+    # 3. ตรวจสอบสิทธิ์
+    report_name = check_user_permission(email, tid)
     if not report_name:
         return (
-            f"🙏 ขออภัยในความไม่สะดวกครับคุณ {user_email.split('@')[0]} "
+            f"🙏 ขออภัยในความไม่สะดวกครับคุณ {email.split('@')[0]} "
             "เนื่องจากระบบตรวจสอบพบว่าคุณยังไม่มีสิทธิ์เข้าถึงรายงานตัวนี้ในขณะนี้\n\n"
             "💡 หากต้องการตรวจสอบหรือดูข้อมูลรายงานเพิ่มเติม สามารถเข้าชมได้ที่ระบบ **sc system** ครับ"
         )
 
+    # 4. ดึงข้อมูลและสร้าง Excel
     try:
-        df = fetch_and_generate_excel(table_id)
+        df = fetch_and_generate_excel(tid)
         if df is None:
             return f"❌ ไม่พบข้อมูลในรายงาน {report_name}"
 
-        file_name = f"Report_{table_id}.xlsx"
+        file_name = f"Report_{tid}.xlsx"
         download_url = f"{PUBLIC_BASE_URL.rstrip('/')}/download/{file_name}"
 
         return (
@@ -202,7 +225,7 @@ def mcp_generate_excel_report(table_id: str) -> str:
         return f"🚨 เกิดข้อผิดพลาด: {str(e)}"
 
 # --------------------------------------------------------
-# Startup / Shutdown (จากโค้ดที่เชื่อมได้)
+# Startup / Shutdown
 # --------------------------------------------------------
 @app.on_event("startup")
 async def startup_event():
@@ -220,26 +243,26 @@ async def shutdown_event():
 # --------------------------------------------------------
 @app.post("/generate_excel_report")
 def generate_excel_report(request: GenerateReportRequest, http_request: Request):
-    table_id = request.table_id
+    tid = clean_table_id(request.table_id)
     user_email = (
         http_request.headers.get("x-user-email")
         or request.user_email
         or DEFAULT_USER_EMAIL
     )
 
-    if not validate_table_id(table_id):
-        return {"success": False, "message": "❌ table_id ไม่ถูกต้อง"}
+    if not validate_table_id(tid):
+        return {"success": False, "message": f"❌ table_id '{tid}' ไม่ถูกต้อง"}
 
-    report_name = check_user_permission(user_email, table_id)
+    report_name = check_user_permission(user_email, tid)
     if not report_name:
         return {"success": False, "message": "🙏 ขออภัย คุณยังไม่มีสิทธิ์เข้าถึงรายงานนี้"}
 
     try:
-        df = fetch_and_generate_excel(table_id)
+        df = fetch_and_generate_excel(tid)
         if df is None:
             return {"success": False, "message": "❌ ไม่พบข้อมูล"}
 
-        file_name = f"Report_{table_id}.xlsx"
+        file_name = f"Report_{tid}.xlsx"
         download_url = f"{PUBLIC_BASE_URL.rstrip('/')}/download/{file_name}"
 
         return {
@@ -250,7 +273,7 @@ def generate_excel_report(request: GenerateReportRequest, http_request: Request)
         return {"success": False, "message": f"🚨 เกิดข้อผิดพลาด: {str(e)}"}
 
 # --------------------------------------------------------
-# Download Excel (🛡️ ป้องกัน Path Traversal) (จากโค้ดเดิม)
+# Download Excel (🛡️ ป้องกัน Path Traversal)
 # --------------------------------------------------------
 @app.get("/download/{file_name}")
 def download_report(file_name: str):
@@ -272,8 +295,7 @@ def download_report(file_name: str):
     )
 
 # --------------------------------------------------------
-# Mount MCP ที่ root "" (จากโค้ดที่เชื่อมได้)
-# ✅ FastMCP จัดการ /mcp path ภายในตัวเอง
+# Mount MCP ที่ root "" — FastMCP จัดการ /mcp path เอง
 # --------------------------------------------------------
 app.mount("", mcp.streamable_http_app())
 
