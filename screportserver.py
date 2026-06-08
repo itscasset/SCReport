@@ -199,7 +199,7 @@ def mcp_generate_excel_report(table_id: str) -> str:
 
 
 # ✅ Mount ที่ /mcp/ (มี trailing slash) — แก้ปัญหา 307 Redirect บน Cloud Run
-app.mount("/mcp/", mcp.streamable_http_app())
+app.mount("/mcp", mcp.streamable_http_app())
 
 # --------------------------------------------------------
 # REST API
@@ -263,34 +263,3 @@ def download_report(file_name: str):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8080)
-import os
-import re
-from contextvars import ContextVar
-from pathlib import Path
-from typing import Optional
-
-import pandas as pd
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
-from google.cloud import bigquery
-from mcp.server.fastmcp import FastMCP
-from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.base import BaseHTTPMiddleware
-
-# --------------------------------------------------------
-# FastAPI App
-# --------------------------------------------------------
-app = FastAPI(
-    title="SC Report MCP API & Server",
-    description="API & MCP Server สำหรับตรวจสอบสิทธิ์และสร้าง Excel Report จาก BigQuery",
-    version="1.0.0",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
