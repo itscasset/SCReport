@@ -71,7 +71,6 @@ def health():
 
 # --------------------------------------------------------
 # Middleware — จับ x-user-email header
-# เพิ่ม debug log เพื่อตรวจสอบว่า Tantawan ส่ง header มาจริงไหม
 # --------------------------------------------------------
 @app.middleware("http")
 async def capture_user_email_header(request: Request, call_next):
@@ -94,7 +93,7 @@ def clean_table_id(raw: str) -> str:
 def validate_table_id(table_id: str) -> bool:
     return bool(re.match(r"^[A-Za-z0-9_]+$", table_id))
 
-def is_valid_email(email: str) -> bool:
+def is_valid_email(email: Optional[str]) -> bool:
     """กรอง None และ literal template string เช่น ${user.email} ออก"""
     if not email:
         return False
@@ -177,22 +176,29 @@ mcp = FastMCP(
     name="generate_excel_report",
     description=(
         "สร้างไฟล์ Excel จากรายงานใน BigQuery และส่งลิงก์ดาวน์โหลด "
-        "ใช้เมื่อผู้ใช้ต้องการดาวน์โหลดข้อมูล ระบุแค่ table_id เท่านั้น "
-        "table_id ที่รองรับ: vrptexpension, vrptexpensionexpmodule"
+        "ใช้เมื่อผู้ใช้ต้องการดาวน์โหลดข้อมูล "
+        "table_id ที่รองรับ: vrptexpension, vrptexpensionexpmodule "
+        "user_email คือ email ของผู้ใช้ที่ระบุไว้ใน system prompt"
     ),
 )
-def mcp_generate_excel_report(table_id: str) -> str:
+def mcp_generate_excel_report(table_id: str, user_email: str) -> str:
     tid = clean_table_id(table_id)
     print(f"📋 [MCP] table_id raw='{table_id}' → clean='{tid}'")
+    print(f"👤 [MCP] user_email arg='{user_email}'")
 
     if not validate_table_id(tid):
         return f"❌ table_id '{tid}' ไม่ถูกต้อง"
 
-    # อ่าน email จาก x-user-email header ที่ middleware inject ไว้
-    # ถ้า Tantawan ไม่ส่ง header มา จะเห็น log: x-user-email=None
-    ctx_email = CURRENT_REQUEST_USER_EMAIL.get()
-    print(f"👤 [MCP] ctx_email from header='{ctx_email}' | is_valid={is_valid_email(ctx_email or '')}")
-    resolved_email = ctx_email if is_valid_email(ctx_email or "") else DEFAULT_USER_EMAIL
+    # ลำดับความสำคัญ email:
+    # 1. user_email จาก tool argument (Claude อ่านจาก system prompt)
+    # 2. x-user-email header ผ่าน ContextVar
+    # 3. DEFAULT_USER_EMAIL
+    if is_valid_email(user_email):
+        resolved_email = user_email
+    else:
+        ctx_email = CURRENT_REQUEST_USER_EMAIL.get()
+        resolved_email = ctx_email if is_valid_email(ctx_email) else DEFAULT_USER_EMAIL
+
     print(f"👤 [MCP] resolved_email='{resolved_email}'")
 
     report_name = check_user_permission(resolved_email, tid)
@@ -288,7 +294,6 @@ def download_report(file_name: str):
 # --------------------------------------------------------
 @app.post("/debug/check_permission")
 def debug_check_permission(request: GenerateReportRequest, http_request: Request):
-    """Debug endpoint — แสดงค่า email และ table_id ที่รับได้จริง"""
     raw_email = (
         http_request.headers.get("x-user-email")
         or request.user_email
@@ -316,3 +321,8 @@ def debug_check_permission(request: GenerateReportRequest, http_request: Request
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8080)
+PYEOF
+echo "done"
+Output
+
+done
