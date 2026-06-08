@@ -70,12 +70,14 @@ def health():
     return {"status": "ok", "service": "sc-report-api-mcp"}
 
 # --------------------------------------------------------
-# Middleware — จับ x-user-email header (ไม่ fallback ที่นี่)
-# ว่า email ถูกต้องหรือไม่จะตรวจใน is_valid_email() แทน
+# Middleware — จับ x-user-email header
+# เพิ่ม debug log เพื่อตรวจสอบว่า Tantawan ส่ง header มาจริงไหม
 # --------------------------------------------------------
 @app.middleware("http")
 async def capture_user_email_header(request: Request, call_next):
-    token = CURRENT_REQUEST_USER_EMAIL.set(request.headers.get("x-user-email"))
+    email = request.headers.get("x-user-email")
+    print(f"📨 [Middleware] {request.method} {request.url.path} | x-user-email={repr(email)}")
+    token = CURRENT_REQUEST_USER_EMAIL.set(email)
     try:
         response = await call_next(request)
     finally:
@@ -93,14 +95,16 @@ def validate_table_id(table_id: str) -> bool:
     return bool(re.match(r"^[A-Za-z0-9_]+$", table_id))
 
 def is_valid_email(email: str) -> bool:
-    """กรอง literal template string เช่น ${user.email} ออก"""
+    """กรอง None และ literal template string เช่น ${user.email} ออก"""
+    if not email:
+        return False
     return bool(re.match(r"^[^@${}]+@[^@${}]+\.[^@${}]+$", email))
 
 # Mapping table_id → keyword สำหรับ LIKE matching
-# ใช้ keyword แทน hardcode ชื่อเต็ม เพื่อรองรับ invisible char ใน DB
+# ใช้ keyword แทน hardcode ชื่อเต็ม เพื่อรองรับ invisible char / spacing ใน DB
 TABLE_TO_KEYWORDS: dict[str, list[str]] = {
-    "vrptexpension":         ["ต้นทุน"],
-    "vrptexpensionexpmodule": ["ค่าใช้จ่าย"],
+    "vrptexpension":          ["ต้นทุน"],
+    "vrptexpensionexpmodule":  ["ค่าใช้จ่าย"],
 }
 
 def check_user_permission(email: str, table_id: str) -> Optional[str]:
@@ -119,7 +123,6 @@ def check_user_permission(email: str, table_id: str) -> Optional[str]:
     print(f"🔍 [Auth] keywords: {keywords}")
 
     try:
-        # สร้าง LIKE condition สำหรับแต่ละ keyword (OR กัน)
         like_clauses = " OR ".join(
             [f"TRIM(ReportName) LIKE @kw{i}" for i in range(len(keywords))]
         )
@@ -162,7 +165,6 @@ def fetch_and_generate_excel(table_id: str) -> Optional[pd.DataFrame]:
 
 # --------------------------------------------------------
 # MCP Server — Stateless HTTP
-# ลบ startup/shutdown ออก ไม่จำเป็นและเป็นสาเหตุ crash
 # --------------------------------------------------------
 mcp = FastMCP(
     "sc-report-server",
@@ -186,11 +188,12 @@ def mcp_generate_excel_report(table_id: str) -> str:
     if not validate_table_id(tid):
         return f"❌ table_id '{tid}' ไม่ถูกต้อง"
 
-    # ✅ อ่าน email จาก x-user-email header เท่านั้น
-    # ไม่รับจาก Claude argument เพราะ Claude อาจส่งค่า template string มา
+    # อ่าน email จาก x-user-email header ที่ middleware inject ไว้
+    # ถ้า Tantawan ไม่ส่ง header มา จะเห็น log: x-user-email=None
     ctx_email = CURRENT_REQUEST_USER_EMAIL.get()
-    resolved_email = ctx_email if (ctx_email and is_valid_email(ctx_email)) else DEFAULT_USER_EMAIL
-    print(f"👤 [MCP] resolved email from header='{ctx_email}' → using='{resolved_email}'")
+    print(f"👤 [MCP] ctx_email from header='{ctx_email}' | is_valid={is_valid_email(ctx_email or '')}")
+    resolved_email = ctx_email if is_valid_email(ctx_email or "") else DEFAULT_USER_EMAIL
+    print(f"👤 [MCP] resolved_email='{resolved_email}'")
 
     report_name = check_user_permission(resolved_email, tid)
     if not report_name:
@@ -218,7 +221,7 @@ def mcp_generate_excel_report(table_id: str) -> str:
         return f"🚨 เกิดข้อผิดพลาด: {str(e)}"
 
 # --------------------------------------------------------
-# Mount MCP กลับที่ root "" ตามที่ client เชื่อมต่อ
+# Mount MCP ที่ root "" ตามที่ Tantawan client เชื่อมต่อ
 # --------------------------------------------------------
 app.mount("", mcp.streamable_http_app())
 
@@ -281,7 +284,7 @@ def download_report(file_name: str):
     )
 
 # --------------------------------------------------------
-# 🔧 DEBUG: ตรวจสอบสิทธิ์โดยตรง (ลบออกเมื่อ deploy จริง)
+# 🔧 DEBUG: ตรวจสอบ email และสิทธิ์โดยตรง (ลบออกเมื่อ deploy จริง)
 # --------------------------------------------------------
 @app.post("/debug/check_permission")
 def debug_check_permission(request: GenerateReportRequest, http_request: Request):
@@ -293,8 +296,7 @@ def debug_check_permission(request: GenerateReportRequest, http_request: Request
     )
     user_email = raw_email if is_valid_email(raw_email) else DEFAULT_USER_EMAIL
     tid = clean_table_id(request.table_id)
-    clean = tid.lower()
-    keywords = TABLE_TO_KEYWORDS.get(clean)
+    keywords = TABLE_TO_KEYWORDS.get(tid.lower())
     result = check_user_permission(user_email, tid)
 
     return {
@@ -302,7 +304,7 @@ def debug_check_permission(request: GenerateReportRequest, http_request: Request
         "resolved_email": user_email,
         "is_valid_email": is_valid_email(raw_email),
         "received_table_id": request.table_id,
-        "cleaned_table_id": clean,
+        "cleaned_table_id": tid.lower(),
         "keywords_used": keywords,
         "permission_result": result,
         "has_permission": result is not None,
