@@ -127,7 +127,6 @@ def check_user_permission(email: str, table_id: str) -> Optional[str]:
             SELECT ReportName
             FROM `{PROJECT_ID}.{DATASET_ID}.{AUTH_TABLE}`
             WHERE LOWER(TRIM(Email)) = LOWER(TRIM(@email))
-            AND TRIM(ReportName) IN ({placeholders})
             LIMIT 1
         """
         params = [bigquery.ScalarQueryParameter("email", "STRING", email)]
