@@ -162,6 +162,12 @@ mcp = FastMCP(
     json_response=True,
 )
 
+@app.get("/mcp-debug")
+def mcp_debug():
+    return {
+        "methods": [m for m in dir(mcp) if not m.startswith("_")],
+    }
+
 @mcp.tool(
     name="generate_excel_report",
     description="ดึงข้อมูลรายงานจาก BigQuery โดยจะเช็คสิทธิ์ผู้ใช้งานจากตาราง AuthenByMenu อัตโนมัติก่อนสร้างไฟล์ Excel",
