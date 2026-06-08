@@ -1,5 +1,5 @@
-import re
 import os
+import re
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Optional
@@ -70,13 +70,12 @@ def health():
     return {"status": "ok", "service": "sc-report-api-mcp"}
 
 # --------------------------------------------------------
-# Middleware — จับ x-user-email header
+# Middleware — จับ x-user-email header (ไม่ fallback ที่นี่)
+# ว่า email ถูกต้องหรือไม่จะตรวจใน is_valid_email() แทน
 # --------------------------------------------------------
 @app.middleware("http")
 async def capture_user_email_header(request: Request, call_next):
-    email = request.headers.get("x-user-email") or DEFAULT_USER_EMAIL
-    print(f"📨 [Request] {request.method} {request.url.path} | x-user-email: {email}")
-    token = CURRENT_REQUEST_USER_EMAIL.set(email)
+    token = CURRENT_REQUEST_USER_EMAIL.set(request.headers.get("x-user-email"))
     try:
         response = await call_next(request)
     finally:
@@ -97,25 +96,28 @@ def is_valid_email(email: str) -> bool:
     """กรอง literal template string เช่น ${user.email} ออก"""
     return bool(re.match(r"^[^@${}]+@[^@${}]+\.[^@${}]+$", email))
 
-# ✅ Mapping ครบทุกรูปแบบตามที่คุณอัปเดตล่าสุด
+# ✅ Mapping ครบทุกรูปแบบ (มีเว้นวรรค / ไม่มี / ชื่อทะเบียนคุม)
 TABLE_TO_REPORT_NAMES: dict[str, list[str]] = {
     "vrptexpension": [
-        "รายงานตรวจสอบการจ่ายเงิน(ต้นทุน)",       # ไม่มีเว้นวรรค
-        "รายงานตรวจสอบการจ่ายเงิน (ต้นทุน)",      # มีเว้นวรรค
-        "ทะเบียนคุมการเบิกจ่าย (ต้นทุน)",          # พบใน DB จริง
+        "รายงานตรวจสอบการจ่ายเงิน(ต้นทุน)",
+        "รายงานตรวจสอบการจ่ายเงิน (ต้นทุน)",
+        "ทะเบียนคุมการเบิกจ่าย (ต้นทุน)",
         "ทะเบียนคุมการเบิกจ่าย(ต้นทุน)",
     ],
     "vrptexpensionexpmodule": [
-        "รายงานตรวจสอบการจ่ายเงิน (ค่าใช้จ่าย)",  # มีเว้นวรรค
-        "รายงานตรวจสอบการจ่ายเงิน(ค่าใช้จ่าย)",   # ไม่มีเว้นวรรค
-        "ทะเบียนคุมการเบิกจ่าย (ค่าใช้จ่าย)",      # พบใน DB จริง
+        "รายงานตรวจสอบการจ่ายเงิน (ค่าใช้จ่าย)",
+        "รายงานตรวจสอบการจ่ายเงิน(ค่าใช้จ่าย)",
+        "ทะเบียนคุมการเบิกจ่าย (ค่าใช้จ่าย)",
         "ทะเบียนคุมการเบิกจ่าย(ค่าใช้จ่าย)",
     ],
 }
 
 def check_user_permission(email: str, table_id: str) -> Optional[str]:
-    """ตรวจสอบสิทธิ์ผู้ใช้จากตาราง AuthenByMenu ใน BigQuery"""
-    clean = table_id.lower()
+    """ตรวจสอบสิทธิ์ผู้ใช้จากตาราง AuthenByMenu ใน BigQuery
+    - ใช้ TRIM(ReportName) IN (...) รองรับชื่อรายงานทุกรูปแบบ
+    - ใช้ = (ไม่ใช่ LIKE) สำหรับ Email เพื่อความปลอดภัย
+    """
+    clean = clean_table_id(table_id).lower()
     report_names = TABLE_TO_REPORT_NAMES.get(clean)
 
     if not report_names:
@@ -165,7 +167,8 @@ def fetch_and_generate_excel(table_id: str) -> Optional[pd.DataFrame]:
     return df
 
 # --------------------------------------------------------
-# MCP Server
+# MCP Server — Stateless HTTP
+# ลบ startup/shutdown ออก ไม่จำเป็นและเป็นสาเหตุ crash
 # --------------------------------------------------------
 mcp = FastMCP(
     "sc-report-server",
@@ -190,14 +193,26 @@ def mcp_generate_excel_report(table_id: str, user_email: str) -> str:
     if not validate_table_id(tid):
         return f"❌ table_id '{tid}' ไม่ถูกต้อง"
 
-    email = user_email if is_valid_email(user_email) else None
-    email = email or CURRENT_REQUEST_USER_EMAIL.get() or DEFAULT_USER_EMAIL
-    print(f"👤 [MCP] user_email raw='{user_email}' → resolved='{email}'")
+    # ✅ ลำดับความสำคัญ email:
+    # 1. user_email จาก tool argument (ถ้า valid)
+    # 2. CURRENT_REQUEST_USER_EMAIL จาก header (ถ้า valid)
+    # 3. DEFAULT_USER_EMAIL
+    resolved_email = None
 
-    report_name = check_user_permission(email, tid)
+    if is_valid_email(user_email or ""):
+        resolved_email = user_email
+    else:
+        ctx_email = CURRENT_REQUEST_USER_EMAIL.get()
+        if ctx_email and is_valid_email(ctx_email):
+            resolved_email = ctx_email
+
+    resolved_email = resolved_email or DEFAULT_USER_EMAIL
+    print(f"👤 [MCP] user_email raw='{user_email}' → resolved='{resolved_email}'")
+
+    report_name = check_user_permission(resolved_email, tid)
     if not report_name:
         return (
-            f"🙏 ขออภัยในความไม่สะดวกครับคุณ {email.split('@')[0]} "
+            f"🙏 ขออภัยในความไม่สะดวกครับคุณ {resolved_email.split('@')[0]} "
             "เนื่องจากระบบตรวจสอบพบว่าคุณยังไม่มีสิทธิ์เข้าถึงรายงานตัวนี้ในขณะนี้\n\n"
             "💡 หากต้องการตรวจสอบหรือดูข้อมูลรายงานเพิ่มเติม สามารถเข้าชมได้ที่ระบบ **sc system** ครับ"
         )
@@ -220,18 +235,9 @@ def mcp_generate_excel_report(table_id: str, user_email: str) -> str:
         return f"🚨 เกิดข้อผิดพลาด: {str(e)}"
 
 # --------------------------------------------------------
-# Startup / Shutdown
+# Mount MCP กลับที่ root "" ตามที่ client เชื่อมต่อ
 # --------------------------------------------------------
-@app.on_event("startup")
-async def startup_event():
-    app.state.mcp_session_manager_ctx = mcp.session_manager.run()
-    await app.state.mcp_session_manager_ctx.__aenter__()
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    ctx = getattr(app.state, "mcp_session_manager_ctx", None)
-    if ctx is not None:
-        await ctx.__aexit__(None, None, None)
+app.mount("", mcp.streamable_http_app())
 
 # --------------------------------------------------------
 # REST API
@@ -239,11 +245,13 @@ async def shutdown_event():
 @app.post("/generate_excel_report")
 def generate_excel_report(request: GenerateReportRequest, http_request: Request):
     tid = clean_table_id(request.table_id)
-    user_email = (
+
+    raw_email = (
         http_request.headers.get("x-user-email")
         or request.user_email
-        or DEFAULT_USER_EMAIL
+        or ""
     )
+    user_email = raw_email if is_valid_email(raw_email) else DEFAULT_USER_EMAIL
 
     if not validate_table_id(tid):
         return {"success": False, "message": f"❌ table_id '{tid}' ไม่ถูกต้อง"}
@@ -268,7 +276,7 @@ def generate_excel_report(request: GenerateReportRequest, http_request: Request)
         return {"success": False, "message": f"🚨 เกิดข้อผิดพลาด: {str(e)}"}
 
 # --------------------------------------------------------
-# Download Excel
+# Download Excel (🛡️ ป้องกัน Path Traversal)
 # --------------------------------------------------------
 @app.get("/download/{file_name}")
 def download_report(file_name: str):
@@ -290,9 +298,32 @@ def download_report(file_name: str):
     )
 
 # --------------------------------------------------------
-# ✅ Mount กลับมาที่ root "" ตามเดิมเพื่อให้ฝั่ง Client เชื่อมต่อได้ถูกต้อง
+# 🔧 DEBUG: ตรวจสอบสิทธิ์โดยตรง (ลบออกเมื่อ deploy จริง)
 # --------------------------------------------------------
-app.mount("", mcp.streamable_http_app())
+@app.post("/debug/check_permission")
+def debug_check_permission(request: GenerateReportRequest, http_request: Request):
+    """Debug endpoint — แสดงค่า email และ table_id ที่รับได้จริง"""
+    raw_email = (
+        http_request.headers.get("x-user-email")
+        or request.user_email
+        or ""
+    )
+    user_email = raw_email if is_valid_email(raw_email) else DEFAULT_USER_EMAIL
+    tid = clean_table_id(request.table_id)
+    clean = tid.lower()
+    report_names = TABLE_TO_REPORT_NAMES.get(clean)
+    result = check_user_permission(user_email, tid)
+
+    return {
+        "received_raw_email": raw_email,
+        "resolved_email": user_email,
+        "is_valid_email": is_valid_email(raw_email),
+        "received_table_id": request.table_id,
+        "cleaned_table_id": clean,
+        "expected_report_names": report_names,
+        "permission_result": result,
+        "has_permission": result is not None,
+    }
 
 # --------------------------------------------------------
 # Entry Point
