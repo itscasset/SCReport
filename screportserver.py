@@ -1,5 +1,5 @@
-import os
 import re
+import os
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Optional
@@ -30,7 +30,7 @@ app.add_middleware(
 )
 
 # --------------------------------------------------------
-# Config
+# Config (จากโค้ดเดิม)
 # --------------------------------------------------------
 PROJECT_ID = "sc-ai-uat"
 DATASET_ID = "SCReport"
@@ -59,12 +59,23 @@ class GenerateReportRequest(BaseModel):
     user_email: Optional[str] = None
 
 # --------------------------------------------------------
+# Basic Routes
+# --------------------------------------------------------
+@app.get("/")
+def read_root():
+    return {"message": "Welcome to SC Report API. MCP server is active at /mcp"}
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "sc-report-api-mcp"}
+
+# --------------------------------------------------------
 # Middleware — จับ x-user-email header
 # --------------------------------------------------------
 @app.middleware("http")
 async def capture_user_email_header(request: Request, call_next):
-    email = request.headers.get("x-user-email")
-    print(f"📨 [Request] {request.method} {request.url.path} | x-user-email: {email or '(not provided)'}")
+    email = request.headers.get("x-user-email") or DEFAULT_USER_EMAIL
+    print(f"📨 [Request] {request.method} {request.url.path} | x-user-email: {email}")
     token = CURRENT_REQUEST_USER_EMAIL.set(email)
     try:
         response = await call_next(request)
@@ -79,6 +90,7 @@ def validate_table_id(table_id: str) -> bool:
     return bool(re.match(r"^[A-Za-z0-9_]+$", table_id))
 
 
+# Mapping table_id → ชื่อรายงานที่อาจเก็บใน DB ทั้ง 2 รูปแบบ (จากโค้ดเดิม)
 TABLE_TO_REPORT_NAMES: dict[str, list[str]] = {
     "vrptexpension": [
         "รายงานตรวจสอบการจ่ายเงิน (ต้นทุน)",
@@ -131,23 +143,27 @@ def check_user_permission(email: str, table_id: str) -> Optional[str]:
 
 
 def fetch_and_generate_excel(table_id: str) -> Optional[pd.DataFrame]:
-    """ดึงข้อมูลจาก BigQuery และบันทึกเป็น Excel"""
-    query = f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.{table_id}` LIMIT 2000"
+    """ดึงข้อมูลจาก BigQuery และบันทึกเป็น Excel (จากโค้ดเดิม)"""
+    clean_table_id = table_id.split(".")[-1]
+    query = f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.{clean_table_id}` LIMIT 2000"
     df = bq_client.query(query).to_dataframe()
     if df.empty:
         return None
+    # Strip timezone จาก datetime columns (Excel ไม่รองรับ timezone-aware)
     for col in df.select_dtypes(include=["datetimetz"]).columns:
         df[col] = df[col].dt.tz_localize(None)
-    file_path = REPORT_DIR / f"Report_{table_id}.xlsx"
+    file_path = REPORT_DIR / f"Report_{clean_table_id}.xlsx"
     df.to_excel(file_path, index=False)
     return df
 
 # --------------------------------------------------------
-# MCP Server
+# MCP Server (การเชื่อมต่อจากโค้ดที่เชื่อมได้)
 # --------------------------------------------------------
 mcp = FastMCP(
     "sc-report-server",
     stateless_http=True,
+    json_response=True,
+    host="0.0.0.0",
 )
 
 @mcp.tool(
@@ -186,26 +202,18 @@ def mcp_generate_excel_report(table_id: str) -> str:
         return f"🚨 เกิดข้อผิดพลาด: {str(e)}"
 
 # --------------------------------------------------------
-# Basic Routes
+# Startup / Shutdown (จากโค้ดที่เชื่อมได้)
 # --------------------------------------------------------
-@app.get("/")
-def read_root():
-    return {"message": "Welcome to SC Report API. MCP server is active at /mcp"}
+@app.on_event("startup")
+async def startup_event():
+    app.state.mcp_session_manager_ctx = mcp.session_manager.run()
+    await app.state.mcp_session_manager_ctx.__aenter__()
 
-@app.get("/health")
-def health():
-    return {"status": "ok", "service": "sc-report-api-mcp"}
-
-# --------------------------------------------------------
-# DEBUG — ตรวจสอบ methods ของ FastMCP (ลบออกหลัง deploy จริง)
-# NOTE: ต้องอยู่ก่อน app.mount("/mcp") เสมอ
-# --------------------------------------------------------
-@app.get("/debug-mcp-methods")
-def debug_mcp_methods():
-    return {
-        "mcp_class": str(type(mcp)),
-        "methods": [m for m in dir(mcp) if not m.startswith("_")],
-    }
+@app.on_event("shutdown")
+async def shutdown_event():
+    ctx = getattr(app.state, "mcp_session_manager_ctx", None)
+    if ctx is not None:
+        await ctx.__aexit__(None, None, None)
 
 # --------------------------------------------------------
 # REST API
@@ -242,7 +250,7 @@ def generate_excel_report(request: GenerateReportRequest, http_request: Request)
         return {"success": False, "message": f"🚨 เกิดข้อผิดพลาด: {str(e)}"}
 
 # --------------------------------------------------------
-# Download Excel (🛡️ ป้องกัน Path Traversal)
+# Download Excel (🛡️ ป้องกัน Path Traversal) (จากโค้ดเดิม)
 # --------------------------------------------------------
 @app.get("/download/{file_name}")
 def download_report(file_name: str):
@@ -264,10 +272,10 @@ def download_report(file_name: str):
     )
 
 # --------------------------------------------------------
-# ✅ Mount MCP LAST — must be after all @app routes
-#    app.mount("/mcp") will swallow any route starting with /mcp
+# Mount MCP ที่ root "" (จากโค้ดที่เชื่อมได้)
+# ✅ FastMCP จัดการ /mcp path ภายในตัวเอง
 # --------------------------------------------------------
-app.mount("/mcp/", mcp.streamable_http_app())
+app.mount("", mcp.streamable_http_app())
 
 # --------------------------------------------------------
 # Entry Point
