@@ -87,7 +87,7 @@ async def capture_user_email_header(request: Request, call_next):
 # Helpers
 # --------------------------------------------------------
 def clean_table_id(raw: str) -> str:
-    """ทำความสะอาด table_id — ลบ backtick, project/dataset prefix, และ whitespace"""
+    """ลบ backtick, project/dataset prefix, และ whitespace"""
     return raw.strip().strip("`").split(".")[-1].strip()
 
 def validate_table_id(table_id: str) -> bool:
@@ -97,21 +97,28 @@ def is_valid_email(email: str) -> bool:
     """กรอง literal template string เช่น ${user.email} ออก"""
     return bool(re.match(r"^[^@${}]+@[^@${}]+\.[^@${}]+$", email))
 
-# Mapping table_id → ชื่อรายงาน รองรับทั้ง 2 รูปแบบ (มีเว้นวรรค / ไม่มี)
+# ✅ Mapping ครบทุกรูปแบบที่พบใน DB จริง
 TABLE_TO_REPORT_NAMES: dict[str, list[str]] = {
     "vrptexpension": [
-        "รายงานตรวจสอบการจ่ายเงิน (ต้นทุน)",
-        "รายงานตรวจสอบการจ่ายเงิน(ต้นทุน)",
+        "รายงานตรวจสอบการจ่ายเงิน(ต้นทุน)",       # ไม่มีเว้นวรรค (พบใน DB จริง)
+        "รายงานตรวจสอบการจ่ายเงิน (ต้นทุน)",      # มีเว้นวรรค
+        "ทะเบียนคุมการเบิกจ่าย (ต้นทุน)",          # พบใน DB จริง
+        "ทะเบียนคุมการเบิกจ่าย(ต้นทุน)",
     ],
     "vrptexpensionexpmodule": [
-        "รายงานตรวจสอบการจ่ายเงิน (ค่าใช้จ่าย)",
-        "รายงานตรวจสอบการจ่ายเงิน(ค่าใช้จ่าย)",
+        "รายงานตรวจสอบการจ่ายเงิน (ค่าใช้จ่าย)",  # มีเว้นวรรค (พบใน DB จริง)
+        "รายงานตรวจสอบการจ่ายเงิน(ค่าใช้จ่าย)",   # ไม่มีเว้นวรรค
+        "ทะเบียนคุมการเบิกจ่าย (ค่าใช้จ่าย)",      # พบใน DB จริง
+        "ทะเบียนคุมการเบิกจ่าย(ค่าใช้จ่าย)",
     ],
 }
 
 
 def check_user_permission(email: str, table_id: str) -> Optional[str]:
-    """ตรวจสอบสิทธิ์ผู้ใช้จากตาราง AuthenByMenu ใน BigQuery"""
+    """
+    ตรวจสอบสิทธิ์ผู้ใช้จากตาราง AuthenByMenu ใน BigQuery
+    ใช้ TRIM() ทั้ง Email และ ReportName เพื่อรองรับช่องว่างใน DB
+    """
     clean = table_id.lower()
     report_names = TABLE_TO_REPORT_NAMES.get(clean)
 
@@ -120,16 +127,18 @@ def check_user_permission(email: str, table_id: str) -> Optional[str]:
         return None
 
     print(f"🔍 [Auth] ตรวจสอบสิทธิ์: {email} → ตาราง: {clean}")
+    print(f"🔍 [Auth] report_names ที่จะเช็ค: {report_names}")
 
     try:
         placeholders = ", ".join([f"@name{i}" for i in range(len(report_names))])
         query = f"""
-            SELECT ReportName
+            SELECT TRIM(ReportName) AS ReportName
             FROM `{PROJECT_ID}.{DATASET_ID}.{AUTH_TABLE}`
             WHERE LOWER(TRIM(Email)) = LOWER(TRIM(@email))
+            AND TRIM(ReportName) IN ({placeholders})
             LIMIT 1
         """
-        params = [bigquery.ScalarQueryParameter("email", "STRING", email)]
+        params = [bigquery.ScalarQueryParameter("email", "STRING", email.strip())]
         for i, name in enumerate(report_names):
             params.append(bigquery.ScalarQueryParameter(f"name{i}", "STRING", name))
 
@@ -181,7 +190,7 @@ mcp = FastMCP(
     ),
 )
 def mcp_generate_excel_report(table_id: str, user_email: str) -> str:
-    # 1. Clean table_id — ลบ backtick, project/dataset prefix
+    # 1. Clean table_id
     tid = clean_table_id(table_id)
     print(f"📋 [MCP] table_id raw='{table_id}' → clean='{tid}'")
 
