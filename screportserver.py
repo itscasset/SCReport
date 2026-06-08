@@ -262,7 +262,8 @@ def download_report(file_name: str):
 # --------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)import os
+    uvicorn.run(app, host="0.0.0.0", port=8080)
+import os
 import re
 from contextvars import ContextVar
 from pathlib import Path
