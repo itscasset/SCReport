@@ -63,7 +63,7 @@ class GenerateReportRequest(BaseModel):
 # --------------------------------------------------------
 @app.get("/")
 def read_root():
-    return {"message": "Welcome to SC Report API. MCP server is active at /mcp"}
+    return {"message": "Welcome to SC Report API. MCP server is active at root (FastMCP)"}
 
 @app.get("/health")
 def health():
@@ -83,7 +83,7 @@ async def capture_user_email_header(request: Request, call_next):
     return response
 
 # --------------------------------------------------------
-# Helpers
+# Helpers & Auth Logic (จากโค้ดของคุณ)
 # --------------------------------------------------------
 def clean_table_id(raw: str) -> str:
     """ลบ backtick, project/dataset prefix, และ whitespace"""
@@ -96,44 +96,42 @@ def is_valid_email(email: str) -> bool:
     """กรอง literal template string เช่น ${user.email} ออก"""
     return bool(re.match(r"^[^@${}]+@[^@${}]+\.[^@${}]+$", email))
 
-# Mapping ชื่อตารางไปยังชื่อรายงานเพื่อเช็คสิทธิ์ใน DB
+# Mapping table_id → ชื่อรายงานที่อาจเก็บใน DB ทั้ง 2 รูปแบบ (มีเว้นวรรค / ไม่มี)
 TABLE_TO_REPORT_NAMES: dict[str, list[str]] = {
     "vrptexpension": [
-        "รายงานตรวจสอบการจ่ายเงิน(ต้นทุน)",
         "รายงานตรวจสอบการจ่ายเงิน (ต้นทุน)",
-        "ทะเบียนคุมการเบิกจ่าย (ต้นทุน)",
-        "ทะเบียนคุมการเบิกจ่าย(ต้นทุน)",
+        "รายงานตรวจสอบการจ่ายเงิน(ต้นทุน)",
     ],
     "vrptexpensionexpmodule": [
         "รายงานตรวจสอบการจ่ายเงิน (ค่าใช้จ่าย)",
         "รายงานตรวจสอบการจ่ายเงิน(ค่าใช้จ่าย)",
-        "ทะเบียนคุมการเบิกจ่าย (ค่าใช้จ่าย)",
-        "ทะเบียนคุมการเบิกจ่าย(ค่าใช้จ่าย)",
     ],
 }
 
 def check_user_permission(email: str, table_id: str) -> Optional[str]:
+    """ตรวจสอบสิทธิ์ผู้ใช้จากตาราง AuthenByMenu ใน BigQuery
+    รองรับชื่อรายงานทั้งแบบมีและไม่มีเว้นวรรคหน้าวงเล็บ
     """
-    เช็คสิทธิ์การเข้าถึงตารางจาก AuthenByMenu ครั้งเดียว
-    ถ้าเจอสิทธิ์ จะคืนค่าชื่อรายงาน (ReportName) กลับไป ถ้าไม่เจอคืนค่า None
-    """
-    clean = table_id.lower()
+    clean = clean_table_id(table_id).lower()
     report_names = TABLE_TO_REPORT_NAMES.get(clean)
 
     if not report_names:
         print(f"🚨 [Auth] ไม่พบ mapping สำหรับตาราง: {clean}")
         return None
 
+    print(f"🔍 [Auth] ตรวจสอบสิทธิ์: {email} → ตาราง: {clean}")
+
     try:
+        # ใช้ IN clause รองรับชื่อรายงานได้หลายรูปแบบในครั้งเดียว
         placeholders = ", ".join([f"@name{i}" for i in range(len(report_names))])
         query = f"""
-            SELECT TRIM(ReportName) AS ReportName
+            SELECT ReportName
             FROM `{PROJECT_ID}.{DATASET_ID}.{AUTH_TABLE}`
             WHERE LOWER(TRIM(Email)) = LOWER(TRIM(@email))
             AND TRIM(ReportName) IN ({placeholders})
             LIMIT 1
         """
-        params = [bigquery.ScalarQueryParameter("email", "STRING", email.strip())]
+        params = [bigquery.ScalarQueryParameter("email", "STRING", email)]
         for i, name in enumerate(report_names):
             params.append(bigquery.ScalarQueryParameter(f"name{i}", "STRING", name))
 
@@ -141,8 +139,11 @@ def check_user_permission(email: str, table_id: str) -> Optional[str]:
         df = bq_client.query(query, job_config=job_config).to_dataframe()
 
         if not df.empty:
-            return df["ReportName"].iloc[0]
+            found = df["ReportName"].iloc[0]
+            print(f"✅ [Auth] พบสิทธิ์: {found}")
+            return found
 
+        print(f"❌ [Auth] ไม่พบสิทธิ์: {email} / {clean}")
         return None
     except Exception as e:
         print(f"🚨 [Auth Error] {str(e)}")
@@ -150,19 +151,20 @@ def check_user_permission(email: str, table_id: str) -> Optional[str]:
 
 def fetch_and_generate_excel(table_id: str) -> Optional[pd.DataFrame]:
     """ดึงข้อมูลจาก BigQuery และบันทึกเป็น Excel"""
-    query = f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.{table_id}` LIMIT 2000"
+    clean_tid = clean_table_id(table_id)
+    query = f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.{clean_tid}` LIMIT 2000"
     df = bq_client.query(query).to_dataframe()
     if df.empty:
         return None
     # Strip timezone จาก datetime columns (Excel ไม่รองรับ timezone-aware)
     for col in df.select_dtypes(include=["datetimetz"]).columns:
         df[col] = df[col].dt.tz_localize(None)
-    file_path = REPORT_DIR / f"Report_{table_id}.xlsx"
+    file_path = REPORT_DIR / f"Report_{clean_tid}.xlsx"
     df.to_excel(file_path, index=False)
     return df
 
 # --------------------------------------------------------
-# MCP Server
+# MCP Server (การตั้งค่า Server ตามรูปแบบของผม)
 # --------------------------------------------------------
 mcp = FastMCP(
     "sc-report-server",
@@ -175,7 +177,8 @@ mcp = FastMCP(
     name="generate_excel_report",
     description=(
         "ดึงข้อมูลรายงานจาก BigQuery และสร้างไฟล์ Excel ให้ดาวน์โหลด "
-        "โดยทำการตรวจสอบสิทธิ์การดูข้อมูลก่อนสร้างไฟล์"
+        "โดยจะเช็คสิทธิ์ผู้ใช้งานจากตาราง AuthenByMenu อัตโนมัติก่อนสร้างไฟล์ "
+        "table_id ที่รองรับ: vrptexpension, vrptexpensionexpmodule"
     ),
 )
 def mcp_generate_excel_report(table_id: str, user_email: str) -> str:
@@ -184,15 +187,17 @@ def mcp_generate_excel_report(table_id: str, user_email: str) -> str:
     if not validate_table_id(tid):
         return f"❌ table_id '{tid}' ไม่ถูกต้อง"
 
+    # กรอง ${user.email} ออก หาก Client ส่งค่าแปลกๆ มา และ fallback ไปใช้ ContextVar
     email = user_email if is_valid_email(user_email) else None
     email = email or CURRENT_REQUEST_USER_EMAIL.get() or DEFAULT_USER_EMAIL
 
-    # เช็คสิทธิ์ครั้งเดียว ถ้ามีสิทธิ์ก็ไปสร้าง Excel เลย
+    # ตรวจสอบสิทธิ์ด้วย Logic ของคุณ
     report_name = check_user_permission(email, tid)
     if not report_name:
         return (
-            f"🙏 ขออภัยคุณ {email.split('@')[0]}\n"
-            "ระบบตรวจสอบพบว่าคุณยังไม่มีสิทธิ์เข้าถึงรายงานนี้ครับ"
+            f"🙏 ขออภัยในความไม่สะดวกครับคุณ {email.split('@')[0]} "
+            "เนื่องจากระบบตรวจสอบพบว่าคุณยังไม่มีสิทธิ์เข้าถึงรายงานตัวนี้ในขณะนี้\n\n"
+            "💡 หากต้องการตรวจสอบหรือดูข้อมูลรายงานเพิ่มเติม สามารถเข้าชมได้ที่ระบบ **sc system** ครับ"
         )
 
     try:
@@ -201,19 +206,23 @@ def mcp_generate_excel_report(table_id: str, user_email: str) -> str:
             return f"❌ ไม่พบข้อมูลในรายงาน {report_name}"
 
         file_name = f"Report_{tid}.xlsx"
-        download_url = f"{PUBLIC_BASE_URL.rstrip('/')}/download/{file_name}"
+        download_url = (
+            f"{PUBLIC_BASE_URL.rstrip('/')}/download/{file_name}"
+            if PUBLIC_BASE_URL
+            else f"/download/{file_name}"
+        )
 
         return (
-            "✅ ตรวจสอบสิทธิ์ผ่านเรียบร้อย\n"
-            f"📊 ระบบเตรียม **รายงาน{report_name}** จำนวน {len(df)} แถวเสร็จสิ้น\n\n"
-            "📥 **ดาวน์โหลดไฟล์:**\n"
+            "✅ ตรวจสอบสิทธิ์ผ่านระบบ AuthenByMenu เรียบร้อยแล้วครับ\n"
+            f"📊 ระบบได้จัดเตรียม **รายงาน{report_name}** จำนวนทั้งหมด {len(df)} แถวให้คุณเรียบร้อยแล้ว\n\n"
+            "📥 **คลิกลิงก์เพื่อดาวน์โหลดไฟล์ลงเครื่อง:**\n"
             f"🔗 {download_url}"
         )
     except Exception as e:
         return f"🚨 เกิดข้อผิดพลาด: {str(e)}"
 
 # --------------------------------------------------------
-# Startup / Shutdown
+# Startup / Shutdown (รักษา Lifecycle ให้ Session)
 # --------------------------------------------------------
 @app.on_event("startup")
 async def startup_event():
@@ -239,21 +248,23 @@ def generate_excel_report(request: GenerateReportRequest, http_request: Request)
     )
 
     if not validate_table_id(tid):
-        return {"success": False, "message": f"❌ table_id '{tid}' ไม่ถูกต้อง"}
+        return {"success": False, "message": "❌ table_id ไม่ถูกต้อง"}
 
-    # เช็คสิทธิ์
     report_name = check_user_permission(user_email, tid)
     if not report_name:
-        return {"success": False, "message": "🙏 ขออภัย คุณไม่มีสิทธิ์เข้าถึงรายงานนี้"}
+        return {"success": False, "message": "🙏 ขออภัย คุณยังไม่มีสิทธิ์เข้าถึงรายงานนี้"}
 
-    # มีสิทธิ์ -> เจเนอเรตไฟล์
     try:
         df = fetch_and_generate_excel(tid)
         if df is None:
             return {"success": False, "message": "❌ ไม่พบข้อมูล"}
 
         file_name = f"Report_{tid}.xlsx"
-        download_url = f"{PUBLIC_BASE_URL.rstrip('/')}/download/{file_name}"
+        download_url = (
+            f"{PUBLIC_BASE_URL.rstrip('/')}/download/{file_name}"
+            if PUBLIC_BASE_URL
+            else f"/download/{file_name}"
+        )
 
         return {
             "success": True,
@@ -263,20 +274,20 @@ def generate_excel_report(request: GenerateReportRequest, http_request: Request)
         return {"success": False, "message": f"🚨 เกิดข้อผิดพลาด: {str(e)}"}
 
 # --------------------------------------------------------
-# Download Excel
+# Download Excel (🛡️ ป้องกัน Path Traversal)
 # --------------------------------------------------------
 @app.get("/download/{file_name}")
 def download_report(file_name: str):
     if not file_name.endswith(".xlsx"):
-        return {"success": False, "message": "❌ อนุญาตเฉพาะไฟล์ .xlsx"}
+        return {"success": False, "message": "❌ อนุญาตเฉพาะไฟล์ .xlsx เท่านั้น"}
 
     file_path = (REPORT_DIR / file_name).resolve()
 
     if not file_path.is_relative_to(REPORT_DIR):
-        return {"success": False, "message": "❌ ไม่มีสิทธิ์เข้าถึงไฟล์"}
+        return {"success": False, "message": "❌ ไม่มีสิทธิ์เข้าถึงไฟล์นอกไดเรกทอรีที่กำหนด"}
 
     if not file_path.exists():
-        return {"success": False, "message": "❌ ไม่พบไฟล์"}
+        return {"success": False, "message": "❌ ไม่พบไฟล์ที่ต้องการดาวน์โหลด"}
 
     return FileResponse(
         path=file_path,
@@ -285,10 +296,13 @@ def download_report(file_name: str):
     )
 
 # --------------------------------------------------------
-# Mount MCP
+# Mount MCP (ที่ root "" ตามรูปแบบของผม)
 # --------------------------------------------------------
 app.mount("", mcp.streamable_http_app())
 
+# --------------------------------------------------------
+# Entry Point
+# --------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8080)
