@@ -96,49 +96,43 @@ def is_valid_email(email: str) -> bool:
     """กรอง literal template string เช่น ${user.email} ออก"""
     return bool(re.match(r"^[^@${}]+@[^@${}]+\.[^@${}]+$", email))
 
-# ✅ Mapping ครบทุกรูปแบบ (มีเว้นวรรค / ไม่มี / ชื่อทะเบียนคุม)
-TABLE_TO_REPORT_NAMES: dict[str, list[str]] = {
-    "vrptexpension": [
-        "รายงานตรวจสอบการจ่ายเงิน(ต้นทุน)",
-        "รายงานตรวจสอบการจ่ายเงิน (ต้นทุน)",
-        "ทะเบียนคุมการเบิกจ่าย (ต้นทุน)",
-        "ทะเบียนคุมการเบิกจ่าย(ต้นทุน)",
-    ],
-    "vrptexpensionexpmodule": [
-        "รายงานตรวจสอบการจ่ายเงิน (ค่าใช้จ่าย)",
-        "รายงานตรวจสอบการจ่ายเงิน(ค่าใช้จ่าย)",
-        "ทะเบียนคุมการเบิกจ่าย (ค่าใช้จ่าย)",
-        "ทะเบียนคุมการเบิกจ่าย(ค่าใช้จ่าย)",
-    ],
+# Mapping table_id → keyword สำหรับ LIKE matching
+# ใช้ keyword แทน hardcode ชื่อเต็ม เพื่อรองรับ invisible char ใน DB
+TABLE_TO_KEYWORDS: dict[str, list[str]] = {
+    "vrptexpension":         ["ต้นทุน"],
+    "vrptexpensionexpmodule": ["ค่าใช้จ่าย"],
 }
 
 def check_user_permission(email: str, table_id: str) -> Optional[str]:
     """ตรวจสอบสิทธิ์ผู้ใช้จากตาราง AuthenByMenu ใน BigQuery
-    - ใช้ TRIM(ReportName) IN (...) รองรับชื่อรายงานทุกรูปแบบ
-    - ใช้ = (ไม่ใช่ LIKE) สำหรับ Email เพื่อความปลอดภัย
+    - ใช้ LIKE กับ ReportName เพื่อรองรับ invisible char / spacing ใน DB
+    - ใช้ = กับ Email เพื่อความปลอดภัย (ห้ามใช้ LIKE)
     """
     clean = clean_table_id(table_id).lower()
-    report_names = TABLE_TO_REPORT_NAMES.get(clean)
+    keywords = TABLE_TO_KEYWORDS.get(clean)
 
-    if not report_names:
+    if not keywords:
         print(f"🚨 [Auth] ไม่พบ mapping สำหรับตาราง: {clean}")
         return None
 
     print(f"🔍 [Auth] ตรวจสอบสิทธิ์: {email} → ตาราง: {clean}")
-    print(f"🔍 [Auth] report_names ที่จะเช็ค: {report_names}")
+    print(f"🔍 [Auth] keywords: {keywords}")
 
     try:
-        placeholders = ", ".join([f"@name{i}" for i in range(len(report_names))])
+        # สร้าง LIKE condition สำหรับแต่ละ keyword (OR กัน)
+        like_clauses = " OR ".join(
+            [f"TRIM(ReportName) LIKE @kw{i}" for i in range(len(keywords))]
+        )
         query = f"""
             SELECT TRIM(ReportName) AS ReportName
             FROM `{PROJECT_ID}.{DATASET_ID}.{AUTH_TABLE}`
             WHERE LOWER(TRIM(Email)) = LOWER(TRIM(@email))
-            AND TRIM(ReportName) IN ({placeholders})
+            AND ({like_clauses})
             LIMIT 1
         """
         params = [bigquery.ScalarQueryParameter("email", "STRING", email.strip())]
-        for i, name in enumerate(report_names):
-            params.append(bigquery.ScalarQueryParameter(f"name{i}", "STRING", name))
+        for i, kw in enumerate(keywords):
+            params.append(bigquery.ScalarQueryParameter(f"kw{i}", "STRING", f"%{kw}%"))
 
         job_config = bigquery.QueryJobConfig(query_parameters=params)
         df = bq_client.query(query, job_config=job_config).to_dataframe()
@@ -180,34 +174,23 @@ mcp = FastMCP(
 @mcp.tool(
     name="generate_excel_report",
     description=(
-        "ดึงข้อมูลรายงานจาก BigQuery และสร้างไฟล์ Excel ให้ดาวน์โหลด "
-        "โดยตรวจสอบสิทธิ์ผู้ใช้จากตาราง AuthenByMenu อัตโนมัติ "
-        "table_id ที่รองรับ: vrptexpension, vrptexpensionexpmodule "
-        "user_email ต้องเป็น email จริงเท่านั้น เช่น name@scasset.com"
+        "สร้างไฟล์ Excel จากรายงานใน BigQuery และส่งลิงก์ดาวน์โหลด "
+        "ใช้เมื่อผู้ใช้ต้องการดาวน์โหลดข้อมูล ระบุแค่ table_id เท่านั้น "
+        "table_id ที่รองรับ: vrptexpension, vrptexpensionexpmodule"
     ),
 )
-def mcp_generate_excel_report(table_id: str, user_email: str) -> str:
+def mcp_generate_excel_report(table_id: str) -> str:
     tid = clean_table_id(table_id)
     print(f"📋 [MCP] table_id raw='{table_id}' → clean='{tid}'")
 
     if not validate_table_id(tid):
         return f"❌ table_id '{tid}' ไม่ถูกต้อง"
 
-    # ✅ ลำดับความสำคัญ email:
-    # 1. user_email จาก tool argument (ถ้า valid)
-    # 2. CURRENT_REQUEST_USER_EMAIL จาก header (ถ้า valid)
-    # 3. DEFAULT_USER_EMAIL
-    resolved_email = None
-
-    if is_valid_email(user_email or ""):
-        resolved_email = user_email
-    else:
-        ctx_email = CURRENT_REQUEST_USER_EMAIL.get()
-        if ctx_email and is_valid_email(ctx_email):
-            resolved_email = ctx_email
-
-    resolved_email = resolved_email or DEFAULT_USER_EMAIL
-    print(f"👤 [MCP] user_email raw='{user_email}' → resolved='{resolved_email}'")
+    # ✅ อ่าน email จาก x-user-email header เท่านั้น
+    # ไม่รับจาก Claude argument เพราะ Claude อาจส่งค่า template string มา
+    ctx_email = CURRENT_REQUEST_USER_EMAIL.get()
+    resolved_email = ctx_email if (ctx_email and is_valid_email(ctx_email)) else DEFAULT_USER_EMAIL
+    print(f"👤 [MCP] resolved email from header='{ctx_email}' → using='{resolved_email}'")
 
     report_name = check_user_permission(resolved_email, tid)
     if not report_name:
@@ -311,7 +294,7 @@ def debug_check_permission(request: GenerateReportRequest, http_request: Request
     user_email = raw_email if is_valid_email(raw_email) else DEFAULT_USER_EMAIL
     tid = clean_table_id(request.table_id)
     clean = tid.lower()
-    report_names = TABLE_TO_REPORT_NAMES.get(clean)
+    keywords = TABLE_TO_KEYWORDS.get(clean)
     result = check_user_permission(user_email, tid)
 
     return {
@@ -320,7 +303,7 @@ def debug_check_permission(request: GenerateReportRequest, http_request: Request
         "is_valid_email": is_valid_email(raw_email),
         "received_table_id": request.table_id,
         "cleaned_table_id": clean,
-        "expected_report_names": report_names,
+        "keywords_used": keywords,
         "permission_result": result,
         "has_permission": result is not None,
     }
