@@ -267,7 +267,7 @@ def download_report(file_name: str):
 # ✅ Mount MCP LAST — must be after all @app routes
 #    app.mount("/mcp") will swallow any route starting with /mcp
 # --------------------------------------------------------
-app.mount("/mcp", mcp.streamable_http_app())
+app.mount("/mcp/", mcp.streamable_http_app())
 
 # --------------------------------------------------------
 # Entry Point
