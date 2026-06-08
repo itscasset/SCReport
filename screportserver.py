@@ -63,7 +63,7 @@ class GenerateReportRequest(BaseModel):
 # --------------------------------------------------------
 @app.get("/")
 def read_root():
-    return {"message": "Welcome to SC Report API. MCP server is active at root (FastMCP)"}
+    return {"message": "Welcome to SC Report API. MCP server is active at /mcp"}
 
 @app.get("/health")
 def health():
@@ -75,6 +75,7 @@ def health():
 @app.middleware("http")
 async def capture_user_email_header(request: Request, call_next):
     email = request.headers.get("x-user-email") or DEFAULT_USER_EMAIL
+    print(f"📨 [Request] {request.method} {request.url.path} | x-user-email: {email}")
     token = CURRENT_REQUEST_USER_EMAIL.set(email)
     try:
         response = await call_next(request)
@@ -83,7 +84,7 @@ async def capture_user_email_header(request: Request, call_next):
     return response
 
 # --------------------------------------------------------
-# Helpers & Auth Logic (จากโค้ดของคุณ)
+# Helpers
 # --------------------------------------------------------
 def clean_table_id(raw: str) -> str:
     """ลบ backtick, project/dataset prefix, และ whitespace"""
@@ -96,23 +97,25 @@ def is_valid_email(email: str) -> bool:
     """กรอง literal template string เช่น ${user.email} ออก"""
     return bool(re.match(r"^[^@${}]+@[^@${}]+\.[^@${}]+$", email))
 
-# Mapping table_id → ชื่อรายงานที่อาจเก็บใน DB ทั้ง 2 รูปแบบ (มีเว้นวรรค / ไม่มี)
+# Mapping ครบทุกรูปแบบที่พบใน DB จริง
 TABLE_TO_REPORT_NAMES: dict[str, list[str]] = {
     "vrptexpension": [
-        "รายงานตรวจสอบการจ่ายเงิน (ต้นทุน)",
-        "รายงานตรวจสอบการจ่ายเงิน(ต้นทุน)",
+        "รายงานตรวจสอบการจ่ายเงิน(ต้นทุน)",       # ไม่มีเว้นวรรค
+        "รายงานตรวจสอบการจ่ายเงิน (ต้นทุน)",      # มีเว้นวรรค
+        "ทะเบียนคุมการเบิกจ่าย (ต้นทุน)",          # พบใน DB จริง
+        "ทะเบียนคุมการเบิกจ่าย(ต้นทุน)",
     ],
     "vrptexpensionexpmodule": [
-        "รายงานตรวจสอบการจ่ายเงิน (ค่าใช้จ่าย)",
-        "รายงานตรวจสอบการจ่ายเงิน(ค่าใช้จ่าย)",
+        "รายงานตรวจสอบการจ่ายเงิน (ค่าใช้จ่าย)",  # มีเว้นวรรค
+        "รายงานตรวจสอบการจ่ายเงิน(ค่าใช้จ่าย)",   # ไม่มีเว้นวรรค
+        "ทะเบียนคุมการเบิกจ่าย (ค่าใช้จ่าย)",      # พบใน DB จริง
+        "ทะเบียนคุมการเบิกจ่าย(ค่าใช้จ่าย)",
     ],
 }
 
 def check_user_permission(email: str, table_id: str) -> Optional[str]:
-    """ตรวจสอบสิทธิ์ผู้ใช้จากตาราง AuthenByMenu ใน BigQuery
-    รองรับชื่อรายงานทั้งแบบมีและไม่มีเว้นวรรคหน้าวงเล็บ
-    """
-    clean = clean_table_id(table_id).lower()
+    """ตรวจสอบสิทธิ์ผู้ใช้จากตาราง AuthenByMenu ใน BigQuery"""
+    clean = table_id.lower()
     report_names = TABLE_TO_REPORT_NAMES.get(clean)
 
     if not report_names:
@@ -122,16 +125,15 @@ def check_user_permission(email: str, table_id: str) -> Optional[str]:
     print(f"🔍 [Auth] ตรวจสอบสิทธิ์: {email} → ตาราง: {clean}")
 
     try:
-        # ใช้ IN clause รองรับชื่อรายงานได้หลายรูปแบบในครั้งเดียว
         placeholders = ", ".join([f"@name{i}" for i in range(len(report_names))])
         query = f"""
-            SELECT ReportName
+            SELECT TRIM(ReportName) AS ReportName
             FROM `{PROJECT_ID}.{DATASET_ID}.{AUTH_TABLE}`
             WHERE LOWER(TRIM(Email)) = LOWER(TRIM(@email))
             AND TRIM(ReportName) IN ({placeholders})
             LIMIT 1
         """
-        params = [bigquery.ScalarQueryParameter("email", "STRING", email)]
+        params = [bigquery.ScalarQueryParameter("email", "STRING", email.strip())]
         for i, name in enumerate(report_names):
             params.append(bigquery.ScalarQueryParameter(f"name{i}", "STRING", name))
 
@@ -151,47 +153,45 @@ def check_user_permission(email: str, table_id: str) -> Optional[str]:
 
 def fetch_and_generate_excel(table_id: str) -> Optional[pd.DataFrame]:
     """ดึงข้อมูลจาก BigQuery และบันทึกเป็น Excel"""
-    clean_tid = clean_table_id(table_id)
-    query = f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.{clean_tid}` LIMIT 2000"
+    query = f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.{table_id}` LIMIT 2000"
     df = bq_client.query(query).to_dataframe()
     if df.empty:
         return None
-    # Strip timezone จาก datetime columns (Excel ไม่รองรับ timezone-aware)
     for col in df.select_dtypes(include=["datetimetz"]).columns:
         df[col] = df[col].dt.tz_localize(None)
-    file_path = REPORT_DIR / f"Report_{clean_tid}.xlsx"
+    file_path = REPORT_DIR / f"Report_{table_id}.xlsx"
     df.to_excel(file_path, index=False)
     return df
 
 # --------------------------------------------------------
-# MCP Server (การตั้งค่า Server ตามรูปแบบของผม)
+# MCP Server
 # --------------------------------------------------------
 mcp = FastMCP(
     "sc-report-server",
     stateless_http=True,
     json_response=True,
-    host="0.0.0.0",
 )
 
 @mcp.tool(
     name="generate_excel_report",
     description=(
         "ดึงข้อมูลรายงานจาก BigQuery และสร้างไฟล์ Excel ให้ดาวน์โหลด "
-        "โดยจะเช็คสิทธิ์ผู้ใช้งานจากตาราง AuthenByMenu อัตโนมัติก่อนสร้างไฟล์ "
-        "table_id ที่รองรับ: vrptexpension, vrptexpensionexpmodule"
+        "โดยตรวจสอบสิทธิ์ผู้ใช้จากตาราง AuthenByMenu อัตโนมัติ "
+        "table_id ที่รองรับ: vrptexpension, vrptexpensionexpmodule "
+        "user_email ต้องเป็น email จริงเท่านั้น เช่น name@scasset.com"
     ),
 )
 def mcp_generate_excel_report(table_id: str, user_email: str) -> str:
     tid = clean_table_id(table_id)
+    print(f"📋 [MCP] table_id raw='{table_id}' → clean='{tid}'")
 
     if not validate_table_id(tid):
         return f"❌ table_id '{tid}' ไม่ถูกต้อง"
 
-    # กรอง ${user.email} ออก หาก Client ส่งค่าแปลกๆ มา และ fallback ไปใช้ ContextVar
     email = user_email if is_valid_email(user_email) else None
     email = email or CURRENT_REQUEST_USER_EMAIL.get() or DEFAULT_USER_EMAIL
+    print(f"👤 [MCP] user_email raw='{user_email}' → resolved='{email}'")
 
-    # ตรวจสอบสิทธิ์ด้วย Logic ของคุณ
     report_name = check_user_permission(email, tid)
     if not report_name:
         return (
@@ -206,11 +206,7 @@ def mcp_generate_excel_report(table_id: str, user_email: str) -> str:
             return f"❌ ไม่พบข้อมูลในรายงาน {report_name}"
 
         file_name = f"Report_{tid}.xlsx"
-        download_url = (
-            f"{PUBLIC_BASE_URL.rstrip('/')}/download/{file_name}"
-            if PUBLIC_BASE_URL
-            else f"/download/{file_name}"
-        )
+        download_url = f"{PUBLIC_BASE_URL.rstrip('/')}/download/{file_name}"
 
         return (
             "✅ ตรวจสอบสิทธิ์ผ่านระบบ AuthenByMenu เรียบร้อยแล้วครับ\n"
@@ -222,7 +218,7 @@ def mcp_generate_excel_report(table_id: str, user_email: str) -> str:
         return f"🚨 เกิดข้อผิดพลาด: {str(e)}"
 
 # --------------------------------------------------------
-# Startup / Shutdown (รักษา Lifecycle ให้ Session)
+# Startup / Shutdown
 # --------------------------------------------------------
 @app.on_event("startup")
 async def startup_event():
@@ -248,7 +244,7 @@ def generate_excel_report(request: GenerateReportRequest, http_request: Request)
     )
 
     if not validate_table_id(tid):
-        return {"success": False, "message": "❌ table_id ไม่ถูกต้อง"}
+        return {"success": False, "message": f"❌ table_id '{tid}' ไม่ถูกต้อง"}
 
     report_name = check_user_permission(user_email, tid)
     if not report_name:
@@ -260,11 +256,7 @@ def generate_excel_report(request: GenerateReportRequest, http_request: Request)
             return {"success": False, "message": "❌ ไม่พบข้อมูล"}
 
         file_name = f"Report_{tid}.xlsx"
-        download_url = (
-            f"{PUBLIC_BASE_URL.rstrip('/')}/download/{file_name}"
-            if PUBLIC_BASE_URL
-            else f"/download/{file_name}"
-        )
+        download_url = f"{PUBLIC_BASE_URL.rstrip('/')}/download/{file_name}"
 
         return {
             "success": True,
@@ -274,7 +266,7 @@ def generate_excel_report(request: GenerateReportRequest, http_request: Request)
         return {"success": False, "message": f"🚨 เกิดข้อผิดพลาด: {str(e)}"}
 
 # --------------------------------------------------------
-# Download Excel (🛡️ ป้องกัน Path Traversal)
+# Download Excel
 # --------------------------------------------------------
 @app.get("/download/{file_name}")
 def download_report(file_name: str):
@@ -296,9 +288,9 @@ def download_report(file_name: str):
     )
 
 # --------------------------------------------------------
-# Mount MCP (ที่ root "" ตามรูปแบบของผม)
+# ✅ Mount ที่ /mcp เพื่อให้ระบบต่อเชื่อม MCP ได้ถูกต้องไม่หลุดอีก
 # --------------------------------------------------------
-app.mount("", mcp.streamable_http_app())
+app.mount("/mcp", mcp.streamable_http_app())
 
 # --------------------------------------------------------
 # Entry Point
