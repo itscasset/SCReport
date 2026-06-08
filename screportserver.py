@@ -63,7 +63,7 @@ class GenerateReportRequest(BaseModel):
 # --------------------------------------------------------
 @app.get("/")
 def read_root():
-    return {"message": "Welcome to SC Report API. MCP server is active at /mcp"}
+    return {"message": "Welcome to SC Report API. MCP server is active at root \"\""}
 
 @app.get("/health")
 def health():
@@ -97,7 +97,7 @@ def is_valid_email(email: str) -> bool:
     """กรอง literal template string เช่น ${user.email} ออก"""
     return bool(re.match(r"^[^@${}]+@[^@${}]+\.[^@${}]+$", email))
 
-# Mapping ครบทุกรูปแบบที่พบใน DB จริง
+# ✅ Mapping ครบทุกรูปแบบตามที่คุณอัปเดตล่าสุด
 TABLE_TO_REPORT_NAMES: dict[str, list[str]] = {
     "vrptexpension": [
         "รายงานตรวจสอบการจ่ายเงิน(ต้นทุน)",       # ไม่มีเว้นวรรค
@@ -123,6 +123,7 @@ def check_user_permission(email: str, table_id: str) -> Optional[str]:
         return None
 
     print(f"🔍 [Auth] ตรวจสอบสิทธิ์: {email} → ตาราง: {clean}")
+    print(f"🔍 [Auth] report_names ที่จะเช็ค: {report_names}")
 
     try:
         placeholders = ", ".join([f"@name{i}" for i in range(len(report_names))])
@@ -170,6 +171,7 @@ mcp = FastMCP(
     "sc-report-server",
     stateless_http=True,
     json_response=True,
+    host="0.0.0.0",
 )
 
 @mcp.tool(
@@ -288,9 +290,9 @@ def download_report(file_name: str):
     )
 
 # --------------------------------------------------------
-# ✅ Mount ที่ /mcp เพื่อให้ระบบต่อเชื่อม MCP ได้ถูกต้องไม่หลุดอีก
+# ✅ Mount กลับมาที่ root "" ตามเดิมเพื่อให้ฝั่ง Client เชื่อมต่อได้ถูกต้อง
 # --------------------------------------------------------
-app.mount("/mcp", mcp.streamable_http_app())
+app.mount("", mcp.streamable_http_app())
 
 # --------------------------------------------------------
 # Entry Point
