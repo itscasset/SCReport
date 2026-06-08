@@ -5,13 +5,12 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from google.cloud import bigquery
 from mcp.server.fastmcp import FastMCP
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.base import BaseHTTPMiddleware
 
 # --------------------------------------------------------
 # FastAPI App
@@ -37,7 +36,10 @@ PROJECT_ID = "sc-ai-uat"
 DATASET_ID = "SCReport"
 AUTH_TABLE = "AuthenByMenu"
 DEFAULT_USER_EMAIL = "test_user@scasset.com"
-PUBLIC_BASE_URL = "https://sc-report-866803019306.asia-southeast3.run.app"
+PUBLIC_BASE_URL = os.environ.get(
+    "PUBLIC_BASE_URL",
+    "https://sc-report-866803019306.asia-southeast3.run.app",
+)
 
 REPORT_DIR = Path("/tmp/reports").resolve()
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
@@ -55,17 +57,6 @@ CURRENT_REQUEST_USER_EMAIL: ContextVar[Optional[str]] = ContextVar(
 class GenerateReportRequest(BaseModel):
     table_id: str
     user_email: Optional[str] = None
-
-# --------------------------------------------------------
-# Basic Routes
-# --------------------------------------------------------
-@app.get("/")
-def read_root():
-    return {"message": "Welcome to SC Report API. MCP server is active at /mcp/"}
-
-@app.get("/health")
-def health():
-    return {"status": "ok", "service": "sc-report-api-mcp"}
 
 # --------------------------------------------------------
 # Middleware — จับ x-user-email header
@@ -88,7 +79,6 @@ def validate_table_id(table_id: str) -> bool:
     return bool(re.match(r"^[A-Za-z0-9_]+$", table_id))
 
 
-# Mapping table_id → ชื่อรายงานที่อาจเก็บใน DB ทั้ง 2 รูปแบบ (มีเว้นวรรค / ไม่มี)
 TABLE_TO_REPORT_NAMES: dict[str, list[str]] = {
     "vrptexpension": [
         "รายงานตรวจสอบการจ่ายเงิน (ต้นทุน)",
@@ -146,7 +136,6 @@ def fetch_and_generate_excel(table_id: str) -> Optional[pd.DataFrame]:
     df = bq_client.query(query).to_dataframe()
     if df.empty:
         return None
-    # Strip timezone จาก datetime columns (Excel ไม่รองรับ timezone-aware)
     for col in df.select_dtypes(include=["datetimetz"]).columns:
         df[col] = df[col].dt.tz_localize(None)
     file_path = REPORT_DIR / f"Report_{table_id}.xlsx"
@@ -154,19 +143,12 @@ def fetch_and_generate_excel(table_id: str) -> Optional[pd.DataFrame]:
     return df
 
 # --------------------------------------------------------
-# ✅ MCP Server — Stateless HTTP
+# MCP Server
 # --------------------------------------------------------
 mcp = FastMCP(
     "sc-report-server",
     stateless_http=True,
-    json_response=True,
 )
-
-@app.get("/mcp-debug")
-def mcp_debug():
-    return {
-        "methods": [m for m in dir(mcp) if not m.startswith("_")],
-    }
 
 @mcp.tool(
     name="generate_excel_report",
@@ -203,9 +185,27 @@ def mcp_generate_excel_report(table_id: str) -> str:
     except Exception as e:
         return f"🚨 เกิดข้อผิดพลาด: {str(e)}"
 
+# --------------------------------------------------------
+# Basic Routes
+# --------------------------------------------------------
+@app.get("/")
+def read_root():
+    return {"message": "Welcome to SC Report API. MCP server is active at /mcp"}
 
-# ✅ Mount ที่ /mcp/ (มี trailing slash) — แก้ปัญหา 307 Redirect บน Cloud Run
-app.mount("/mcp", mcp.streamable_http_app())
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "sc-report-api-mcp"}
+
+# --------------------------------------------------------
+# DEBUG — ตรวจสอบ methods ของ FastMCP (ลบออกหลัง deploy จริง)
+# NOTE: ต้องอยู่ก่อน app.mount("/mcp") เสมอ
+# --------------------------------------------------------
+@app.get("/debug-mcp-methods")
+def debug_mcp_methods():
+    return {
+        "mcp_class": str(type(mcp)),
+        "methods": [m for m in dir(mcp) if not m.startswith("_")],
+    }
 
 # --------------------------------------------------------
 # REST API
@@ -262,6 +262,12 @@ def download_report(file_name: str):
         filename=file_name,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+# --------------------------------------------------------
+# ✅ Mount MCP LAST — must be after all @app routes
+#    app.mount("/mcp") will swallow any route starting with /mcp
+# --------------------------------------------------------
+app.mount("/mcp", mcp.streamable_http_app())
 
 # --------------------------------------------------------
 # Entry Point
