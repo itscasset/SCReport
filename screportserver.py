@@ -181,41 +181,31 @@ mcp = FastMCP(
         "user_email คือ email ของผู้ใช้ที่ระบุไว้ใน system prompt"
     ),
 )
-def mcp_generate_excel_report(table_id: str, user_email: str) -> str:
-    tid = clean_table_id(table_id)
-    print(f"📋 [MCP] table_id raw='{table_id}' → clean='{tid}'")
-    print(f"👤 [MCP] user_email arg='{user_email}'")
+def mcp_generate_excel_report(table_id: str) -> str:
+    user_email = CURRENT_REQUEST_USER_EMAIL.get() or DEFAULT_USER_EMAIL
 
-    if not validate_table_id(tid):
-        return f"❌ table_id '{tid}' ไม่ถูกต้อง"
+    if not validate_table_id(table_id):
+        return "❌ table_id ไม่ถูกต้อง"
 
-    # ลำดับความสำคัญ email:
-    # 1. user_email จาก tool argument (Claude อ่านจาก system prompt)
-    # 2. x-user-email header ผ่าน ContextVar
-    # 3. DEFAULT_USER_EMAIL
-    if is_valid_email(user_email):
-        resolved_email = user_email
-    else:
-        ctx_email = CURRENT_REQUEST_USER_EMAIL.get()
-        resolved_email = ctx_email if is_valid_email(ctx_email) else DEFAULT_USER_EMAIL
-
-    print(f"👤 [MCP] resolved_email='{resolved_email}'")
-
-    report_name = check_user_permission(resolved_email, tid)
+    report_name = check_user_permission(user_email, table_id)
     if not report_name:
         return (
-            f"🙏 ขออภัยในความไม่สะดวกครับคุณ {resolved_email.split('@')[0]} "
+            f"🙏 ขออภัยในความไม่สะดวกครับคุณ {user_email.split('@')[0]} "
             "เนื่องจากระบบตรวจสอบพบว่าคุณยังไม่มีสิทธิ์เข้าถึงรายงานตัวนี้ในขณะนี้\n\n"
             "💡 หากต้องการตรวจสอบหรือดูข้อมูลรายงานเพิ่มเติม สามารถเข้าชมได้ที่ระบบ **sc system** ครับ"
         )
 
     try:
-        df = fetch_and_generate_excel(tid)
+        df = fetch_and_generate_excel(table_id)
         if df is None:
             return f"❌ ไม่พบข้อมูลในรายงาน {report_name}"
 
-        file_name = f"Report_{tid}.xlsx"
-        download_url = f"{PUBLIC_BASE_URL.rstrip('/')}/download/{file_name}"
+        file_name = f"Report_{table_id}.xlsx"
+        download_url = (
+            f"{PUBLIC_BASE_URL.rstrip('/')}/download/{file_name}"
+            if PUBLIC_BASE_URL
+            else f"/download/{file_name}"
+        )
 
         return (
             "✅ ตรวจสอบสิทธิ์ผ่านระบบ AuthenByMenu เรียบร้อยแล้วครับ\n"
@@ -226,10 +216,8 @@ def mcp_generate_excel_report(table_id: str, user_email: str) -> str:
     except Exception as e:
         return f"🚨 เกิดข้อผิดพลาด: {str(e)}"
 
-# --------------------------------------------------------
-# Mount MCP ที่ root "" ตามที่ Tantawan client เชื่อมต่อ
-# --------------------------------------------------------
-app.mount("", mcp.streamable_http_app())
+
+
 
 # --------------------------------------------------------
 # REST API
@@ -316,13 +304,14 @@ def debug_check_permission(request: GenerateReportRequest, http_request: Request
     }
 
 # --------------------------------------------------------
+# Mount MCP Apps (ต้องไว้ท้ายสุดเพื่อไม่ให้ intercept routes อื่น)
+# --------------------------------------------------------
+app.mount("/mcp", mcp.streamable_http_app())
+app.mount("", mcp.streamable_http_app())
+
+# --------------------------------------------------------
 # Entry Point
 # --------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8080)
-PYEOF
-echo "done"
-Output
-
-done
