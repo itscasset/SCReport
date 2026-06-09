@@ -174,7 +174,7 @@ def check_user_permission(email: str, table_id: str) -> Optional[str]:
         return None
     except Exception as e:
         print(f"🚨 [Auth Error] {str(e)}")
-        return None
+        raise e
 
 def fetch_and_generate_excel(table_id: str, limit: int = 2000, condition: Optional[str] = None) -> Optional[pd.DataFrame]:
     """ดึงข้อมูลจาก BigQuery และบันทึกเป็น Excel"""
@@ -323,8 +323,14 @@ def debug_check_permission(request: GenerateReportRequest, http_request: Request
     user_email = raw_email if is_valid_email(raw_email) else DEFAULT_USER_EMAIL
     clean = clean_table_id(request.table_id)
     report_names = TABLE_TO_REPORT_NAMES.get(clean.lower())
-    result = check_user_permission(user_email, request.table_id)
-
+    
+    error_msg = None
+    result = None
+    try:
+        result = check_user_permission(user_email, request.table_id)
+    except Exception as e:
+        error_msg = str(e)
+ 
     return {
         "received_raw_email": raw_email,
         "resolved_email": user_email,
@@ -334,6 +340,7 @@ def debug_check_permission(request: GenerateReportRequest, http_request: Request
         "expected_report_names": report_names,
         "permission_result": result,
         "has_permission": result is not None,
+        "error": error_msg,
     }
 
 # --------------------------------------------------------
