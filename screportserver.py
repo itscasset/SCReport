@@ -4,7 +4,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Optional
 
-import pandas as pd
+from openpyxl import Workbook
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -176,8 +176,8 @@ def check_user_permission(email: str, table_id: str) -> Optional[str]:
         print(f"🚨 [Auth Error] {str(e)}")
         raise e
 
-def fetch_and_generate_excel(table_id: str, limit: int = 2000, condition: Optional[str] = None) -> Optional[pd.DataFrame]:
-    """ดึงข้อมูลจาก BigQuery และบันทึกเป็น Excel"""
+def fetch_and_generate_excel(table_id: str, limit: int = 2000, condition: Optional[str] = None) -> Optional[int]:
+    """ดึงข้อมูลจาก BigQuery และบันทึกเป็น Excel (โดยใช้ openpyxl ตรงๆ ไม่ใช้ pandas และ db-dtypes)"""
     # แปลง table_id เป็นชื่อตารางจริงที่มีตัวพิมพ์ใหญ่-เล็กตรงกับ BigQuery
     clean = clean_table_id(table_id).lower()
     bq_table_name = TABLE_TO_BQ_TABLE_NAME.get(clean, table_id)
@@ -188,14 +188,34 @@ def fetch_and_generate_excel(table_id: str, limit: int = 2000, condition: Option
         where_clause = f" WHERE {clean_condition}"
         
     query = f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.{bq_table_name}`{where_clause} LIMIT {limit}"
-    df = bq_client.query(query).to_dataframe()
-    if df.empty:
+    
+    job = bq_client.query(query)
+    results = list(job)
+    if not results:
         return None
-    for col in df.select_dtypes(include=["datetimetz"]).columns:
-        df[col] = df[col].dt.tz_localize(None)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Report"
+
+    # เขียน headers
+    headers = [field.name for field in job.schema]
+    ws.append(headers)
+
+    # เขียน data
+    for row in results:
+        row_values = []
+        for field in job.schema:
+            val = row[field.name]
+            # เคลียร์ timezone info สำหรับ datetime
+            if hasattr(val, "tzinfo") and val.tzinfo is not None:
+                val = val.replace(tzinfo=None)
+            row_values.append(val)
+        ws.append(row_values)
+
     file_path = REPORT_DIR / f"Report_{table_id}.xlsx"
-    df.to_excel(file_path, index=False)
-    return df
+    wb.save(file_path)
+    return len(results)
 
 # --------------------------------------------------------
 # MCP Server — Stateless HTTP
@@ -234,8 +254,8 @@ def mcp_generate_excel_report(table_id: str, user_email: Optional[str] = None, l
         )
 
     try:
-        df = fetch_and_generate_excel(table_id, limit=limit, condition=condition)
-        if df is None:
+        row_count = fetch_and_generate_excel(table_id, limit=limit, condition=condition)
+        if row_count is None:
             return f"❌ ไม่พบข้อมูลในรายงาน {report_name}"
 
         file_name = f"Report_{table_id}.xlsx"
@@ -244,7 +264,7 @@ def mcp_generate_excel_report(table_id: str, user_email: Optional[str] = None, l
 
         return (
             "✅ ตรวจสอบสิทธิ์ผ่านระบบ AuthenByMenu เรียบร้อยแล้วครับ\n"
-            f"📊 ระบบได้จัดเตรียม **รายงาน{report_name}** จำนวนทั้งหมด {len(df)} แถวให้คุณเรียบร้อยแล้ว\n\n"
+            f"📊 ระบบได้จัดเตรียม **รายงาน{report_name}** จำนวนทั้งหมด {row_count} แถวให้คุณเรียบร้อยแล้ว\n\n"
             "📥 **คลิกลิงก์เพื่อดาวน์โหลดไฟล์ลงเครื่อง:**\n"
             f"🔗 {download_url}"
         )
@@ -273,8 +293,8 @@ def generate_excel_report(request: GenerateReportRequest, http_request: Request)
         return {"success": False, "message": "🙏 ขออภัย คุณยังไม่มีสิทธิ์เข้าถึงรายงานนี้"}
 
     try:
-        df = fetch_and_generate_excel(tid, limit=request.limit, condition=request.condition)
-        if df is None:
+        row_count = fetch_and_generate_excel(tid, limit=request.limit, condition=request.condition)
+        if row_count is None:
             return {"success": False, "message": "❌ ไม่พบข้อมูล"}
 
         file_name = f"Report_{tid}.xlsx"

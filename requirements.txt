@@ -2,7 +2,5 @@ fastapi==0.136.1
 uvicorn==0.47.0
 sse-starlette==3.4.4
 mcp==1.27.1
-pandas==3.0.3
 openpyxl==3.1.5
 google-cloud-bigquery==3.41.0
-db-dtypes
