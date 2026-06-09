@@ -178,19 +178,19 @@ mcp = FastMCP(
         "สร้างไฟล์ Excel จากรายงานใน BigQuery และส่งลิงก์ดาวน์โหลด "
         "ใช้เมื่อผู้ใช้ต้องการดาวน์โหลดข้อมูล "
         "table_id ที่รองรับ: vrptexpension, vrptexpensionexpmodule "
-        "user_email คือ email ของผู้ใช้ที่ระบุไว้ใน system prompt"
+        "user_email คือ email ของผู้ใช้ที่ระบุไว้ใน system prompt โปรดส่ง parameter นี้มาด้วยทุกครั้ง"
     ),
 )
-def mcp_generate_excel_report(table_id: str) -> str:
-    user_email = CURRENT_REQUEST_USER_EMAIL.get() or DEFAULT_USER_EMAIL
+def mcp_generate_excel_report(table_id: str, user_email: Optional[str] = None) -> str:
+    email_to_use = user_email or CURRENT_REQUEST_USER_EMAIL.get() or DEFAULT_USER_EMAIL
 
     if not validate_table_id(table_id):
         return "❌ table_id ไม่ถูกต้อง"
 
-    report_name = check_user_permission(user_email, table_id)
+    report_name = check_user_permission(email_to_use, table_id)
     if not report_name:
         return (
-            f"🙏 ขออภัยในความไม่สะดวกครับคุณ {user_email.split('@')[0]} "
+            f"🙏 ขออภัยในความไม่สะดวกครับคุณ {email_to_use.split('@')[0]} "
             "เนื่องจากระบบตรวจสอบพบว่าคุณยังไม่มีสิทธิ์เข้าถึงรายงานตัวนี้ในขณะนี้\n\n"
             "💡 หากต้องการตรวจสอบหรือดูข้อมูลรายงานเพิ่มเติม สามารถเข้าชมได้ที่ระบบ **sc system** ครับ"
         )
