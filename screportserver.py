@@ -51,6 +51,11 @@ CURRENT_REQUEST_USER_EMAIL: ContextVar[Optional[str]] = ContextVar(
     default=None,
 )
 
+CURRENT_REQUEST_BASE_URL: ContextVar[Optional[str]] = ContextVar(
+    "current_request_base_url",
+    default=None,
+)
+
 # --------------------------------------------------------
 # Models
 # --------------------------------------------------------
@@ -78,11 +83,17 @@ def health():
 async def capture_user_email_header(request: Request, call_next):
     email = request.headers.get("x-user-email")
     print(f"📨 [Middleware] {request.method} {request.url.path} | x-user-email={repr(email)}")
-    token = CURRENT_REQUEST_USER_EMAIL.set(email)
+    token_email = CURRENT_REQUEST_USER_EMAIL.set(email)
+    
+    # Capture the base URL dynamically (e.g. http://localhost:8080 or https://sc-report-...)
+    base_url = str(request.base_url).rstrip("/")
+    token_base = CURRENT_REQUEST_BASE_URL.set(base_url)
+    
     try:
         response = await call_next(request)
     finally:
-        CURRENT_REQUEST_USER_EMAIL.reset(token)
+        CURRENT_REQUEST_USER_EMAIL.reset(token_email)
+        CURRENT_REQUEST_BASE_URL.reset(token_base)
     return response
 
 # --------------------------------------------------------
@@ -228,11 +239,8 @@ def mcp_generate_excel_report(table_id: str, user_email: Optional[str] = None, l
             return f"❌ ไม่พบข้อมูลในรายงาน {report_name}"
 
         file_name = f"Report_{table_id}.xlsx"
-        download_url = (
-            f"{PUBLIC_BASE_URL.rstrip('/')}/download/{file_name}"
-            if PUBLIC_BASE_URL
-            else f"/download/{file_name}"
-        )
+        base_url = CURRENT_REQUEST_BASE_URL.get() or PUBLIC_BASE_URL
+        download_url = f"{base_url.rstrip('/')}/download/{file_name}"
 
         return (
             "✅ ตรวจสอบสิทธิ์ผ่านระบบ AuthenByMenu เรียบร้อยแล้วครับ\n"
@@ -270,7 +278,8 @@ def generate_excel_report(request: GenerateReportRequest, http_request: Request)
             return {"success": False, "message": "❌ ไม่พบข้อมูล"}
 
         file_name = f"Report_{tid}.xlsx"
-        download_url = f"{PUBLIC_BASE_URL.rstrip('/')}/download/{file_name}"
+        base_url = CURRENT_REQUEST_BASE_URL.get() or PUBLIC_BASE_URL
+        download_url = f"{base_url.rstrip('/')}/download/{file_name}"
 
         return {
             "success": True,
