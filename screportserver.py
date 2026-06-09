@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 PROJECT_ID = "sc-ai-uat"
 DATASET_ID = "SCReport"
 AUTH_TABLE = "AuthenByMenu"
-DEFAULT_USER_EMAIL = ""
+DEFAULT_USERNAME = ""
 PUBLIC_BASE_URL = os.environ.get(
     "PUBLIC_BASE_URL",
     "https://sc-report-866803019306.asia-southeast3.run.app",
@@ -30,8 +30,8 @@ REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 bq_client = bigquery.Client(project=PROJECT_ID)
 
-CURRENT_REQUEST_USER_EMAIL: ContextVar[Optional[str]] = ContextVar(
-    "current_request_user_email",
+CURRENT_REQUEST_USERNAME: ContextVar[Optional[str]] = ContextVar(
+    "current_request_username",
     default=None,
 )
 
@@ -45,6 +45,7 @@ CURRENT_REQUEST_BASE_URL: ContextVar[Optional[str]] = ContextVar(
 # --------------------------------------------------------
 class GenerateReportRequest(BaseModel):
     table_id: str
+    username: Optional[str] = None
     user_email: Optional[str] = None
     limit: int = 2000
     condition: Optional[str] = None
@@ -125,22 +126,29 @@ def health():
 # Middleware — จับ current-user หรือ x-user-email header
 # --------------------------------------------------------
 @app.middleware("http")
-async def capture_user_email_header(request: Request, call_next):
-    email = (
-        request.headers.get("current_user")
-        # or request.headers.get("current_user")
-        or request.headers.get("x-user-email")
-    )
-    print(f"📨 [Middleware] {request.method} {request.url.path} | email={repr(email)}")
-    token_email = CURRENT_REQUEST_USER_EMAIL.set(email)
-
+async def capture_username_header(request: Request, call_next):
+    username_val = None
+    header_checked = []
+    
+    for header_name in ["current-user", "current_user", "x-user-email"]:
+        val = request.headers.get(header_name)
+        header_checked.append(f"{header_name}={repr(val)}")
+        if val:
+            username_val = val
+            break
+    
+    print(f"📨 [Middleware] {request.method} {request.url.path}")
+    print(f"   Headers checked: {', '.join(header_checked)}")
+    print(f"   Resolved username: {repr(username_val)}")
+    
+    token_username = CURRENT_REQUEST_USERNAME.set(username_val)
     base_url = str(request.base_url).rstrip("/")
     token_base = CURRENT_REQUEST_BASE_URL.set(base_url)
 
     try:
         response = await call_next(request)
     finally:
-        CURRENT_REQUEST_USER_EMAIL.reset(token_email)
+        CURRENT_REQUEST_USERNAME.reset(token_username)
         CURRENT_REQUEST_BASE_URL.reset(token_base)
     return response
 
@@ -148,14 +156,12 @@ async def capture_user_email_header(request: Request, call_next):
 # Helpers
 # --------------------------------------------------------
 def clean_table_id(raw: str) -> str:
-    """ลบ backtick, project/dataset prefix, และ whitespace"""
     return raw.strip().strip("`").split(".")[-1].strip()
 
 def validate_table_id(table_id: str) -> bool:
     return bool(re.match(r"^[A-Za-z0-9_]+$", table_id))
 
 def is_valid_user(user: Optional[str]) -> bool:
-    """กรอง None, empty, และ literal template string เช่น ${user.email} หรือ {{current_user}} ออก"""
     if not user:
         return False
     user_str = user.strip()
@@ -165,27 +171,47 @@ def is_valid_user(user: Optional[str]) -> bool:
         return False
     return True
 
-def check_user_permission(user_val: str, table_id: str) -> Optional[str]:
-    """ตรวจสอบสิทธิ์ผู้ใช้จากตาราง AuthenByMenu ใน BigQuery"""
+def resolve_username(provided_username: Optional[str]) -> str:
+    print(f"\n🔧 [resolve_username] START")
+    print(f"   📥 provided_username: {repr(provided_username)}")
+    
+    context_username = CURRENT_REQUEST_USERNAME.get()
+    print(f"   📨 CURRENT_REQUEST_USERNAME (from middleware): {repr(context_username)}")
+    
+    if is_valid_user(provided_username):
+        print(f"   ✅ Step 1: provided_username ถูกต้อง")
+        return provided_username
+    
+    if provided_username is not None and provided_username != "":
+        if is_valid_user(context_username):
+            return context_username
+    
+    if provided_username is None:
+        if is_valid_user(context_username):
+            return context_username
+    
+    if DEFAULT_USERNAME:
+        return DEFAULT_USERNAME
+    
+    return ""
+
+def check_user_permission(username: str, table_id: str) -> Optional[str]:
     clean = clean_table_id(table_id).lower()
     report_names = TABLE_TO_REPORT_NAMES.get(clean)
 
     if not report_names:
-        print(f"🚨 [Auth] ไม่พบ mapping สำหรับตาราง: {clean}")
         return None
-
-    print(f"🔍 [Auth] ตรวจสอบสิทธิ์: {user_val} → ตาราง: {clean}")
 
     try:
         placeholders = ", ".join([f"@name{i}" for i in range(len(report_names))])
         query = f"""
             SELECT ReportName
             FROM `{PROJECT_ID}.{DATASET_ID}.{AUTH_TABLE}`
-            WHERE (LOWER(TRIM(UserName)) = LOWER(TRIM(@user_val)) OR LOWER(TRIM(Email)) = LOWER(TRIM(@user_val)))
+            WHERE LOWER(TRIM(UserName)) = LOWER(TRIM(@username))
             AND TRIM(ReportName) IN ({placeholders})
             LIMIT 1
         """
-        params = [bigquery.ScalarQueryParameter("user_val", "STRING", user_val.strip())]
+        params = [bigquery.ScalarQueryParameter("username", "STRING", username.strip())]
         for i, name in enumerate(report_names):
             params.append(bigquery.ScalarQueryParameter(f"name{i}", "STRING", name))
 
@@ -194,18 +220,13 @@ def check_user_permission(user_val: str, table_id: str) -> Optional[str]:
         results = list(job)
 
         if results:
-            found = results[0]["ReportName"]
-            print(f"✅ [Auth] พบสิทธิ์: {found}")
-            return found
-
-        print(f"❌ [Auth] ไม่พบสิทธิ์: {user_val} / {clean}")
+            return results[0]["ReportName"]
         return None
     except Exception as e:
         print(f"🚨 [Auth Error] {str(e)}")
         raise e
 
 def fetch_and_generate_excel(table_id: str, limit: int = 2000, condition: Optional[str] = None) -> Optional[int]:
-    """ดึงข้อมูลจาก BigQuery และบันทึกเป็น Excel (ใช้ openpyxl ตรงๆ ไม่ใช้ pandas และ db-dtypes)"""
     clean = clean_table_id(table_id).lower()
     bq_table_name = TABLE_TO_BQ_TABLE_NAME.get(clean, table_id)
 
@@ -250,32 +271,23 @@ def fetch_and_generate_excel(table_id: str, limit: int = 2000, condition: Option
     name="generate_excel_report",
     description=(
         "สร้างไฟล์ Excel จากรายงานใน BigQuery และส่งลิงก์ดาวน์โหลด\n"
-        "table_id ที่รองรับ:\n"
-        "1. 'vrptexpension' -> สำหรับ 'รายงานตรวจสอบการจ่ายเงิน(ต้นทุน)' และ 'ทะเบียนคุมการเบิกจ่าย (ต้นทุน)'\n"
-        "2. 'vrptexpensionexpmodule' -> สำหรับ 'รายงานตรวจสอบการจ่ายเงิน (ค่าใช้จ่าย)' และ 'ทะเบียนคุมการเบิกจ่าย (ค่าใช้จ่าย)'\n"
-        "user_email คือ email ของผู้ใช้ที่ระบุไว้ใน system prompt โปรดส่ง parameter นี้มาด้วยทุกครั้ง\n"
-        "limit: จำนวนแถว (ค่าเริ่มต้น 2000)\n"
-        "condition: เงื่อนไข SQL WHERE (ไม่ต้องมีคำว่า WHERE) เช่น \"ProjectName = 'โครงการ A'\""
+        "table_id ที่รองรับ: vrptexpension, vrptexpensionexpmodule"
     ),
 )
 def mcp_generate_excel_report(
     table_id: str,
-    user_email: Optional[str] = None,
+    username: Optional[str] = None,
     limit: int = 2000,
     condition: Optional[str] = None,
 ) -> str:
-    email_to_use = user_email or CURRENT_REQUEST_USER_EMAIL.get() or DEFAULT_USER_EMAIL
+    username_to_use = resolve_username(username)
 
     if not validate_table_id(table_id):
         return "❌ table_id ไม่ถูกต้อง"
 
-    report_name = check_user_permission(email_to_use, table_id)
+    report_name = check_user_permission(username_to_use, table_id)
     if not report_name:
-        return (
-            f"🙏 ขออภัยในความไม่สะดวกครับคุณ {email_to_use.split('@')[0]} "
-            "เนื่องจากระบบตรวจสอบพบว่าคุณยังไม่มีสิทธิ์เข้าถึงรายงานตัวนี้ในขณะนี้\n\n"
-            "💡 หากต้องการตรวจสอบหรือดูข้อมูลรายงานเพิ่มเติม สามารถเข้าชมได้ที่ระบบ **sc system** ครับ"
-        )
+        return f"🙏 ขออภัยในความไม่สะดวกครับคุณ {username_to_use} คุณยังไม่มีสิทธิ์เข้าถึงรายงานนี้"
 
     try:
         row_count = fetch_and_generate_excel(table_id, limit=limit, condition=condition)
@@ -287,9 +299,8 @@ def mcp_generate_excel_report(
         download_url = f"{base_url.rstrip('/')}/download/{file_name}"
 
         return (
-            "✅ ตรวจสอบสิทธิ์ผ่านระบบ AuthenByMenu เรียบร้อยแล้วครับ\n"
-            f"📊 ระบบได้จัดเตรียม **รายงาน{report_name}** จำนวนทั้งหมด {row_count} แถวให้คุณเรียบร้อยแล้ว\n\n"
-            "📥 **คลิกลิงก์เพื่อดาวน์โหลดไฟล์ลงเครื่อง:**\n"
+            f"📊 ระบบได้จัดเตรียม **รายงาน{report_name}** ({row_count} แถว) เรียบร้อยแล้วครับ\n\n"
+            "📥 **คลิกลิงก์ด้านล่างเพื่อดาวน์โหลด (แท็บจะปิดตัวลงเมื่อดาวน์โหลดเสร็จสิ้น):**\n"
             f"🔗 {download_url}"
         )
     except Exception as e:
@@ -301,20 +312,20 @@ def mcp_generate_excel_report(
 @app.post("/generate_excel_report")
 def generate_excel_report(request: GenerateReportRequest, http_request: Request):
     tid = clean_table_id(request.table_id)
-
-    raw_email = (
+    raw_username = (
         http_request.headers.get("current-user")
         or http_request.headers.get("current_user")
         or http_request.headers.get("x-user-email")
+        or request.username
         or request.user_email
         or ""
     )
-    user_email = raw_email if is_valid_user(raw_email) else DEFAULT_USER_EMAIL
+    username_val = raw_username if is_valid_user(raw_username) else DEFAULT_USERNAME
 
     if not validate_table_id(tid):
         return {"success": False, "message": f"❌ table_id '{tid}' ไม่ถูกต้อง"}
 
-    report_name = check_user_permission(user_email, tid)
+    report_name = check_user_permission(username_val, tid)
     if not report_name:
         return {"success": False, "message": "🙏 ขออภัย คุณยังไม่มีสิทธิ์เข้าถึงรายงานนี้"}
 
@@ -335,7 +346,7 @@ def generate_excel_report(request: GenerateReportRequest, http_request: Request)
         return {"success": False, "message": f"🚨 เกิดข้อผิดพลาด: {str(e)}"}
 
 # --------------------------------------------------------
-# Download Excel (🛡️ ป้องกัน Path Traversal)
+# Download Excel (🛡️ ป้องกัน Path Traversal + Auto Close Tab)
 # --------------------------------------------------------
 @app.get("/download/{file_name}")
 def download_report(file_name: str, direct: bool = False):
@@ -350,6 +361,7 @@ def download_report(file_name: str, direct: bool = False):
     if not file_path.exists():
         return {"success": False, "message": "❌ ไม่พบไฟล์ที่ต้องการดาวน์โหลด"}
 
+    # 1. หากสคริปต์ JavaScript เรียกกลับมาด้วย direct=true ให้ส่งตัวไฟล์กลับไปตรงๆ
     if direct:
         return FileResponse(
             path=file_path,
@@ -357,303 +369,93 @@ def download_report(file_name: str, direct: bool = False):
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-    # Render a premium landing page to prevent browser/iframe sandbox from blocking direct downloads
-    file_size_bytes = os.path.getsize(file_path)
-    if file_size_bytes < 1024:
-        file_size_str = f"{file_size_bytes} B"
-    elif file_size_bytes < 1024 * 1024:
-        file_size_str = f"{file_size_bytes / 1024:.1f} KB"
-    else:
-        file_size_str = f"{file_size_bytes / (1024 * 1024):.1f} MB"
-
-    download_url = f"/download/{file_name}?direct=true"
-
+    # 2. หากเปิดมาแบบปกติ (เช่น ถูกคลิกจาก Chat Interface) ให้รันหน้าเว็บเปล่าเพื่อยิงดาวน์โหลดและปิดแท็บตัวเองทันที
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Download Report | SC Asset</title>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
+    <title>Downloading Report...</title>
     <style>
-        :root {{
-            --bg-color: #0d0f12;
-            --card-bg: rgba(22, 28, 36, 0.75);
-            --primary: #cda34f;
-            --primary-hover: #b8903e;
-            --text-color: #e2e8f0;
-            --text-muted: #94a3b8;
-            --border-color: rgba(205, 163, 79, 0.2);
-            --success: #10b981;
-        }}
-        
-        * {{
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-        }}
-        
         body {{
-            font-family: 'Outfit', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background: radial-gradient(circle at top, #1e2025 0%, var(--bg-color) 100%);
-            color: var(--text-color);
-            min-height: 100vh;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+            background-color: #0d0f12;
+            color: #e2e8f0;
             display: flex;
-            flex-direction: column;
             justify-content: center;
             align-items: center;
-            padding: 20px;
+            height: 100vh;
+            margin: 0;
         }}
-
-        .glow {{
-            position: absolute;
-            width: 400px;
-            height: 400px;
-            background: radial-gradient(circle, rgba(205, 163, 79, 0.08) 0%, rgba(0,0,0,0) 70%);
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            z-index: 0;
-            pointer-events: none;
-        }}
-
-        .container {{
-            position: relative;
-            background: var(--card-bg);
-            backdrop-filter: blur(16px);
-            -webkit-backdrop-filter: blur(16px);
-            border: 1px solid var(--border-color);
-            border-radius: 24px;
-            padding: 40px 30px;
-            width: 100%;
-            max-width: 480px;
+        .loader-container {{
             text-align: center;
-            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.4);
-            z-index: 1;
-            animation: fadeIn 0.8s cubic-bezier(0.16, 1, 0.3, 1);
         }}
-
-        @keyframes fadeIn {{
-            from {{ opacity: 0; transform: translateY(20px); }}
-            to {{ opacity: 1; transform: translateY(0); }}
-        }}
-
-        .logo {{
-            font-weight: 800;
-            font-size: 24px;
-            letter-spacing: 2px;
-            color: var(--primary);
-            margin-bottom: 30px;
-            text-transform: uppercase;
-        }}
-
-        .icon-wrapper {{
-            position: relative;
-            width: 100px;
-            height: 100px;
-            margin: 0 auto 30px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            background: rgba(205, 163, 79, 0.1);
-            border-radius: 50%;
-            border: 1px solid rgba(205, 163, 79, 0.3);
-        }}
-
-        .icon-wrapper svg {{
-            width: 48px;
-            height: 48px;
-            fill: var(--primary);
-            animation: bounce 2s infinite;
-        }}
-
-        @keyframes bounce {{
-            0%, 100% {{ transform: translateY(0); }}
-            50% {{ transform: translateY(-8px); }}
-        }}
-
-        .title {{
-            font-size: 22px;
-            font-weight: 600;
-            margin-bottom: 10px;
-            color: #ffffff;
-        }}
-
-        .subtitle {{
-            font-size: 14px;
-            color: var(--text-muted);
-            margin-bottom: 30px;
-        }}
-
-        .file-info {{
-            background: rgba(255, 255, 255, 0.03);
-            border: 1px solid rgba(255, 255, 255, 0.05);
-            border-radius: 16px;
-            padding: 16px;
-            margin-bottom: 30px;
-            text-align: left;
-        }}
-
-        .file-info-row {{
-            display: flex;
-            justify-content: space-between;
-            margin-bottom: 8px;
-            font-size: 14px;
-        }}
-
-        .file-info-row:last-child {{
-            margin-bottom: 0;
-        }}
-
-        .label {{
-            color: var(--text-muted);
-        }}
-
-        .value {{
-            font-weight: 500;
-            color: #ffffff;
-            word-break: break-all;
-            max-width: 250px;
-            text-align: right;
-        }}
-
-        .btn-download {{
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            width: 100%;
-            padding: 16px;
-            background: var(--primary);
-            color: #000000;
-            border: none;
-            border-radius: 14px;
-            font-size: 16px;
-            font-weight: 600;
-            cursor: pointer;
-            text-decoration: none;
-            transition: all 0.2s ease;
-            box-shadow: 0 4px 14px rgba(205, 163, 79, 0.3);
-        }}
-
-        .btn-download:hover {{
-            background: var(--primary-hover);
-            transform: translateY(-2px);
-            box-shadow: 0 6px 20px rgba(205, 163, 79, 0.4);
-        }}
-
-        .btn-download:active {{
-            transform: translateY(0);
-        }}
-
-        .auto-start {{
-            margin-top: 20px;
-            font-size: 13px;
-            color: var(--text-muted);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 8px;
-        }}
-
         .spinner {{
-            width: 16px;
-            height: 16px;
-            border: 2px solid rgba(255, 255, 255, 0.1);
-            border-top-color: var(--primary);
+            width: 32px;
+            height: 32px;
+            border: 3px solid rgba(255, 255, 255, 0.1);
+            border-top-color: #cda34f;
             border-radius: 50%;
-            animation: spin 1s linear infinite;
+            animation: spin 0.8s linear infinite;
+            margin: 0 auto 16px;
         }}
-
         @keyframes spin {{
             to {{ transform: rotate(360deg); }}
         }}
     </style>
 </head>
 <body>
-    <div class="glow"></div>
-    <div class="container">
-        <div class="logo">SC ASSET</div>
-        <div class="icon-wrapper">
-            <svg viewBox="0 0 24 24">
-                <path d="M5,20H19V18H5M19,9H15V3H9V9H5L12,16L19,9Z"/>
-            </svg>
-        </div>
-        <h1 class="title">Your report is ready</h1>
-        <p class="subtitle">Click the button below to download your spreadsheet.</p>
-        
-        <div class="file-info">
-            <div class="file-info-row">
-                <span class="label">File Name</span>
-                <span class="value">{file_name}</span>
-            </div>
-            <div class="file-info-row">
-                <span class="label">File Size</span>
-                <span class="value">{file_size_str}</span>
-            </div>
-            <div class="file-info-row">
-                <span class="label">Format</span>
-                <span class="value">Excel Spreadsheet (.xlsx)</span>
-            </div>
-        </div>
-
-        <a href="{download_url}" id="downloadLink" class="btn-download">
-            Download Report
-        </a>
-
-        <div class="auto-start" id="autoStart">
-            <div class="spinner"></div>
-            <span>Downloading will start automatically in a moment...</span>
-        </div>
+    <div class="loader-container">
+        <div class="spinner"></div>
+        <p style="font-size: 15px; letter-spacing: 0.5px;">กำลังดาวน์โหลดไฟล์และจะปิดหน้าต่างนี้อัตโนมัติ...</p>
+        <p style="font-size: 12px; color: #94a3b8; margin-top: 5px;">หากแท็บไม่ปิดเอง คุณสามารถกดปิดหน้าต่างนี้ได้ทันที</p>
     </div>
 
     <script>
-        // Auto-trigger download after 800ms
+        // ใช้เทคนิค Hidden IFrame เพื่อยิงดาวน์โหลดไฟล์โดยตรง ไม่ให้รบกวนโครงสร้างหน้าเว็บหลัก
+        const downloadUrl = window.location.pathname + "?direct=true";
+        const iframe = document.createElement('iframe');
+        iframe.style.display = 'none';
+        iframe.src = downloadUrl;
+        document.body.appendChild(iframe);
+
+        // ทำการปิดแท็บทันทีเมื่อจัดส่งคำสั่งไปยัง IFrame เรียบร้อย (หน่วงเวลาสั้นๆ เพื่อให้ Browser ประมวลผลดาวน์โหลดสำเร็จ)
         setTimeout(() => {{
-            const link = document.getElementById('downloadLink');
-            const tempLink = document.createElement('a');
-            tempLink.href = link.href;
-            tempLink.target = '_blank';
-            document.body.appendChild(tempLink);
-            tempLink.click();
-            document.body.removeChild(tempLink);
-            
-            setTimeout(() => {{
-                const autoStart = document.getElementById('autoStart');
-                autoStart.innerHTML = '<span>If the download did not start, please click the button above.</span>';
-            }}, 1500);
-        }}, 800);
+            window.close();
+        }}, 1000);
     </script>
 </body>
 </html>"""
+    
     return HTMLResponse(content=html_content)
 
 # --------------------------------------------------------
-# 🔧 DEBUG: ตรวจสอบ email และสิทธิ์โดยตรง (ลบออกเมื่อ deploy จริง)
+# DEBUG
 # --------------------------------------------------------
 @app.post("/debug/check_permission")
 def debug_check_permission(request: GenerateReportRequest, http_request: Request):
-    raw_email = (
+    raw_username = (
         http_request.headers.get("current-user")
         or http_request.headers.get("current_user")
         or http_request.headers.get("x-user-email")
+        or request.username
         or request.user_email
         or ""
     )
-    user_email = raw_email if is_valid_user(raw_email) else DEFAULT_USER_EMAIL
+    username_val = raw_username if is_valid_user(raw_username) else DEFAULT_USERNAME
     clean = clean_table_id(request.table_id)
     report_names = TABLE_TO_REPORT_NAMES.get(clean.lower())
 
     error_msg = None
     result = None
     try:
-        result = check_user_permission(user_email, request.table_id)
+        result = check_user_permission(username_val, request.table_id)
     except Exception as e:
         error_msg = str(e)
 
     return {
-        "received_raw_email": raw_email,
-        "resolved_email": user_email,
-        "is_valid_email": is_valid_user(raw_email),
+        "received_raw_username": raw_username,
+        "resolved_username": username_val,
+        "is_valid_user": is_valid_user(raw_username),
         "received_table_id": request.table_id,
         "cleaned_table_id": clean.lower(),
         "expected_report_names": report_names,
@@ -662,15 +464,8 @@ def debug_check_permission(request: GenerateReportRequest, http_request: Request
         "error": error_msg,
     }
 
-# --------------------------------------------------------
-# Mount MCP ที่ root "" เพื่อให้ /mcp path ทำงานถูกต้อง
-# (FastAPI explicit routes เช่น /, /health จะถูก match ก่อน mount เสมอ)
-# --------------------------------------------------------
 app.mount("", mcp_asgi_app)
 
-# --------------------------------------------------------
-# Entry Point
-# --------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8080)
