@@ -1,46 +1,67 @@
+"""
+SC Report Server - Minimal Working Version
+Avoids google.cloud namespace pollution by importing submodules directly
+"""
+
 import os
 import re
+import sys
 import uuid
 import logging
 import io
 from datetime import timedelta
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from pathlib import Path
 from typing import Optional, Tuple
 
-from openpyxl import Workbook
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
-from google.cloud import bigquery
-from google.cloud import storage  # 👈 เพิ่มเข้ามาสำหรับบริหารจัดการ GCS
-from mcp.server.fastmcp import FastMCP
-from fastapi.middleware.cors import CORSMiddleware
+# ============================================================================
+# CRITICAL: Import google cloud submodules DIRECTLY (avoids namespace issues)
+# ============================================================================
+try:
+    import google.cloud.bigquery as bigquery
+    import google.cloud.storage as storage
+except ImportError as e:
+    print(f"FATAL: Google Cloud libraries not installed")
+    print(f"Error: {e}")
+    print(f"Fix: pip install google-cloud-bigquery google-cloud-storage")
+    sys.exit(1)
 
-# --------------------------------------------------------
+# Import FastAPI after google.cloud is safe
+try:
+    from fastapi import FastAPI, Request
+    from fastapi.middleware.cors import CORSMiddleware
+    from pydantic import BaseModel
+    from openpyxl import Workbook
+    from mcp.server.fastmcp import FastMCP
+except ImportError as e:
+    print(f"FATAL: Required library missing: {e}")
+    sys.exit(1)
+
+# ============================================================================
 # Configuration
-# --------------------------------------------------------
-PROJECT_ID = "sc-ai-uat"
-DATASET_ID = "SCReport"
-AUTH_TABLE = "AuthenByMenu"
-DEFAULT_USERNAME = ""
+# ============================================================================
+PROJECT_ID = os.environ.get("PROJECT_ID", "sc-ai-uat")
+DATASET_ID = os.environ.get("DATASET_ID", "SCReport")
+AUTH_TABLE = os.environ.get("AUTH_TABLE", "AuthenByMenu")
+GCS_BUCKET = os.environ.get("GCS_REPORT_BUCKET", "sc-report-files-uat")
 
-# 🪣 ดึงชื่อสลอตถังเก็บรายงาน GCS จาก Environment Variable (หรือระบุ Default)
-GCS_BUCKET_NAME = os.environ.get("GCS_REPORT_BUCKET", "sc-report-files-uat")
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("sc-report")
 
-bq_client = bigquery.Client(project=PROJECT_ID)
-# ☁️ ประกาศใช้งาน Storage Client สำหรับ Cloud Storage
-gcs_client = storage.Client(project=PROJECT_ID)
+# Global clients
+bq_client = None
+gcs_client = None
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("SCReportSecurity")
+# Request context
+CURRENT_USERNAME = ContextVar("username", default=None)
 
-CURRENT_REQUEST_USERNAME: ContextVar[Optional[str]] = ContextVar("current_request_username", default=None)
 
-# --------------------------------------------------------
-# Models (รองรับทุกพารามิเตอร์ของ Agent เพื่อป้องกัน 422 Error)
-# --------------------------------------------------------
+# ============================================================================
+# Models
+# ============================================================================
 class GenerateReportRequest(BaseModel):
     table_id: str
     limit: int = 2000
@@ -51,208 +72,300 @@ class GenerateReportRequest(BaseModel):
     user_email: Optional[str] = None
 
     class Config:
-        extra = "allow" # บล็อกปัญหากรณี Agent ส่งฟิลด์ประหลาดๆ แนบมา
+        extra = "allow"
 
-# --------------------------------------------------------
-# Mapping ตารางรายงานและสิทธิ์ ###ควรเพิ่มการหาชื่อรายงานในฐานข้อมูล###
-# --------------------------------------------------------
-TABLE_TO_REPORT_NAMES: dict[str, list[str]] = {
-    "vrptexpension": ["รายงานตรวจสอบการจ่ายเงิน (ต้นทุน)", "รายงานตรวจสอบการจ่ายเงิน(ต้นทุน)", "ทะเบียนคุมการเบิกจ่าย (ต้นทุน)", "ทะเบียนคุมการเบิกจ่าย(ต้นทุน)"],
-    "vrptexpensionexpmodule": ["รายงานตรวจสอบการจ่ายเงิน (ค่าใช้จ่าย)", "รายงานตรวจสอบการจ่ายเงิน(ค่าใช้จ่าย)", "ทะเบียนคุมการเบิกจ่าย (ค่าใช้จ่าย)", "ทะเบียนคุมการเบิกจ่าย(ค่าใช้จ่าย)"],
+
+# ============================================================================
+# Report Mapping
+# ============================================================================
+TABLE_MAPPING = {
+    "vrptexpension": {
+        "report_names": [
+            "รายงานตรวจสอบการจ่ายเงิน (ต้นทุน)",
+            "รายงานตรวจสอบการจ่ายเงิน(ต้นทุน)",
+        ],
+        "bq_table": "VRptExpension",
+    },
+    "vrptexpensionexpmodule": {
+        "report_names": [
+            "รายงานตรวจสอบการจ่ายเงิน (ค่าใช้จ่าย)",
+            "รายงานตรวจสอบการจ่ายเงิน(ค่าใช้จ่าย)",
+        ],
+        "bq_table": "VRptExpensionExpModule",
+    },
 }
 
-TABLE_TO_BQ_TABLE_NAME: dict[str, str] = {
-    "vrptexpension": "VRptExpension",
-    "vrptexpensionexpmodule": "VRptExpensionExpModule",
-}
 
-# --------------------------------------------------------
-# Application Lifespan Setup
-# --------------------------------------------------------
-mcp = FastMCP("sc-report-server", stateless_http=True, json_response=True, host="0.0.0.0")
-mcp_asgi_app = mcp.streamable_http_app()
+# ============================================================================
+# Initialization
+# ============================================================================
+def init_clients():
+    """Initialize BigQuery and GCS clients"""
+    global bq_client, gcs_client
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    async with mcp.session_manager.run():
-        yield
-
-app = FastAPI(title="Secure SC Report API", version="2.0.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-
-@app.middleware("http")
-async def capture_username_header(request: Request, call_next):
-    username_val = None
-    for header_name in ["current-user", "current_user", "x-user-email"]:
-        val = request.headers.get(header_name)
-        if val:
-            username_val = val
-            break
-    token_username = CURRENT_REQUEST_USERNAME.set(username_val)
     try:
-        response = await call_next(request)
-    finally:
-        CURRENT_REQUEST_USERNAME.reset(token_username)
-    return response
+        logger.info(f"Initializing BigQuery (project: {PROJECT_ID})")
+        bq_client = bigquery.Client(project=PROJECT_ID)
+        logger.info("✅ BigQuery client ready")
+    except Exception as e:
+        logger.error(f"FATAL: BigQuery init failed: {e}")
+        sys.exit(1)
 
-# --------------------------------------------------------
-# Security Helpers
-# --------------------------------------------------------
+    try:
+        logger.info(f"Initializing GCS (bucket: {GCS_BUCKET})")
+        gcs_client = storage.Client(project=PROJECT_ID)
+        bucket = gcs_client.bucket(GCS_BUCKET)
+        bucket.reload()
+        logger.info("✅ GCS client ready")
+    except Exception as e:
+        logger.error(f"FATAL: GCS init failed: {e}")
+        sys.exit(1)
+
+
+# ============================================================================
+# Security & Validation
+# ============================================================================
 def clean_table_id(raw: str) -> str:
-    return raw.strip().strip("`").split(".")[-1].strip()
+    return raw.strip().strip("`").split(".")[-1].strip().lower()
 
-def validate_table_id(table_id: str) -> bool:
-    return bool(re.match(r"^[A-Za-z0-9_]+$", table_id))
 
 def is_valid_user(user: Optional[str]) -> bool:
-    if not user: return False
-    user_str = user.strip()
-    if not user_str or "${" in user_str or "}" in user_str or "{{" in user_str: return False
-    return True
+    if not user:
+        return False
+    s = user.strip()
+    return s and "${" not in s and "}}" not in s
 
-def resolve_username(fallback_user: Optional[str] = None, fallback_email: Optional[str] = None) -> str:
-    context_username = CURRENT_REQUEST_USERNAME.get()
-    if is_valid_user(context_username):
-        return context_username
-    if is_valid_user(fallback_user):
-        return fallback_user
-    if is_valid_user(fallback_email):
-        return fallback_email
-    return DEFAULT_USERNAME if DEFAULT_USERNAME else ""
 
-def check_user_permission(username: str, table_id: str) -> Optional[str]:
-    clean = clean_table_id(table_id).lower()
-    if "AuthenByMenu" in clean:
-        logger.warning("🚨 Security Blocked Access Attempt to AuthenByMenu table")
+def get_username(user: Optional[str], email: Optional[str]) -> str:
+    ctx = CURRENT_USERNAME.get()
+    if is_valid_user(ctx):
+        return ctx
+    if is_valid_user(user):
+        return user
+    if is_valid_user(email):
+        return email
+    return ""
+
+
+def check_permission(username: str, table_id: str) -> Optional[str]:
+    """Check if user can access table. Returns report name if allowed."""
+    table_clean = clean_table_id(table_id)
+
+    if "authenby" in table_clean:
+        logger.warning(f"🚨 Blocked: {username} tried to access auth table")
         return None
 
-    report_names = TABLE_TO_REPORT_NAMES.get(clean)
-    if not report_names:
+    mapping = TABLE_MAPPING.get(table_clean)
+    if not mapping:
         return None
 
     try:
+        report_names = mapping["report_names"]
         placeholders = ", ".join([f"@name{i}" for i in range(len(report_names))])
         query = f"""
-            SELECT ReportName FROM `{PROJECT_ID}.{DATASET_ID}.{AUTH_TABLE}` 
-            WHERE LOWER(TRIM(UserName)) = LOWER(TRIM(@username)) 
-            AND TRIM(ReportName) IN ({placeholders}) LIMIT 1
+            SELECT ReportName FROM `{PROJECT_ID}.{DATASET_ID}.{AUTH_TABLE}`
+            WHERE LOWER(TRIM(UserName)) = LOWER(TRIM(@username))
+            AND TRIM(ReportName) IN ({placeholders})
+            LIMIT 1
         """
-        params = [bigquery.ScalarQueryParameter("username", "STRING", username.strip())]
+
+        params = [
+            bigquery.ScalarQueryParameter("username", "STRING", username.strip())
+        ]
         for i, name in enumerate(report_names):
             params.append(bigquery.ScalarQueryParameter(f"name{i}", "STRING", name))
 
         job_config = bigquery.QueryJobConfig(query_parameters=params)
-        job = bq_client.query(query, job_config=job_config)
-        results = list(job)
-        return results[0]["ReportName"] if results else None
+        results = list(bq_client.query(query, job_config=job_config))
+        
+        if results:
+            return results[0]["ReportName"]
+        return None
     except Exception as e:
-        logger.error(f"Auth verification failed: {e}")
+        logger.error(f"Permission check failed: {e}")
         return None
 
-# --------------------------------------------------------
-# 🔥 REFACTORED: ฟังก์ชันดึงข้อมูลแบบเขียนลง GCS โดยตรงผ่าน RAM
-# --------------------------------------------------------
-def fetch_and_generate_excel_gcs(
-    table_id: str, 
-    limit: int = 2000, 
-    filter_column: Optional[str] = None, 
-    filter_value: Optional[str] = None,
-    condition: Optional[str] = None
-) -> Tuple[Optional[int], Optional[str]]:
-    """
-    🚀 ฟังก์ชันดึงข้อมูลจาก BigQuery และเขียนเป็นไฟล์ Excel บนสตรีมหน่วยความจำ (RAM)
-    จากนั้นอัปโหลดไปยัง Google Cloud Storage และสร้าง Signed URL สำหรับใช้ดาวน์โหลดได้อย่างปลอดภัย
-    """
-    clean = clean_table_id(table_id).lower()
-    if "AuthenByMenu" in clean:
-        raise PermissionError("Access to the authentication table is strictly prohibited at code level.")
 
-    bq_table_name = TABLE_TO_BQ_TABLE_NAME.get(clean, table_id)
-    query = f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.{bq_table_name}`"
-    params = []
+# ============================================================================
+# Report Generation
+# ============================================================================
+def generate_report(
+    table_id: str,
+    limit: int = 2000,
+    filter_col: Optional[str] = None,
+    filter_val: Optional[str] = None,
+    condition: Optional[str] = None,
+) -> Tuple[Optional[int], Optional[str]]:
+    """Generate Excel and upload to GCS. Returns (row_count, signed_url)"""
     
-    # ดักกรองเงื่อนไข
-    if filter_column and filter_value:
-        if re.match(r"^[A-Za-z0-9_]+$", filter_column):
-            query += f" WHERE {filter_column} = @filter_value"
-            params.append(bigquery.ScalarQueryParameter("filter_value", "STRING", filter_value))
-            
+    table_clean = clean_table_id(table_id)
+    if "authenby" in table_clean:
+        raise PermissionError("Auth table access denied")
+
+    mapping = TABLE_MAPPING.get(table_clean)
+    if not mapping:
+        raise ValueError(f"Unknown table: {table_id}")
+
+    bq_table = mapping["bq_table"]
+    query = f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.{bq_table}`"
+    params = []
+
+    # Apply filters
+    if filter_col and filter_val and re.match(r"^[A-Za-z0-9_]+$", filter_col):
+        query += f" WHERE {filter_col} = @val"
+        params.append(bigquery.ScalarQueryParameter("val", "STRING", filter_val))
     elif condition:
-        # SQL Injection Basic Firewall
-        forbidden_keywords = [";", "union", "select", "insert", "update", "delete", "drop", "alter", "grant", "exec", "AuthenByMenu"]
-        cond_lower = condition.lower()
-        if any(keyword in cond_lower for keyword in forbidden_keywords):
-            logger.warning(f"🚨 SQL Firewall Blocked Dangerous Condition: {condition}")
-            raise PermissionError("ไม่อนุญาตให้ใช้คำสั่ง SQL ที่อาจเป็นอันตรายในเงื่อนไข (SQL Firewall)")
+        # Block dangerous SQL
+        dangerous = [";", "union", "select", "insert", "delete", "drop"]
+        if any(x in condition.lower() for x in dangerous):
+            raise PermissionError("Unsafe condition")
         query += f" WHERE {condition}"
 
-    safe_limit = min(max(limit, 1), 10000) 
-    query += f" LIMIT {safe_limit}"
+    query += f" LIMIT {min(max(limit, 1), 10000)}"
 
-    # ยิงคำสั่งดึงข้อมูลจาก BigQuery
+    # Execute query
+    logger.info(f"Query: {bq_table} (limit: {limit})")
     job_config = bigquery.QueryJobConfig(query_parameters=params)
-    job = bq_client.query(query, job_config=job_config)
-    result = job.result()
-    schema = result.schema
-    results = list(result)
-    
-    if not results: 
+    results = list(bq_client.query(query, job_config=job_config).result())
+
+    if not results:
         return None, None
 
-    # 📊 สร้างไฟล์ Excel ใน Memory (In-Memory Buffer)
+    # Create Excel
     wb = Workbook()
     ws = wb.active
     ws.title = "Report"
-    ws.append([field.name for field in schema])
+
+    schema = bq_client.query(query, job_config=job_config).result().schema
+    ws.append([f.name for f in schema])
 
     for row in results:
-        row_values = []
+        values = []
         for field in schema:
             val = row[field.name]
-            # ตัดเขตเวลา (Timezone) ออกเพื่อหลีกเลี่ยงข้อผิดพลาดของ openpyxl
-            if hasattr(val, "tzinfo") and val.tzinfo is not None:
+            if hasattr(val, "tzinfo") and val.tzinfo:
                 val = val.replace(tzinfo=None)
-            row_values.append(val)
-        ws.append(row_values)
+            values.append(val)
+        ws.append(values)
 
-    # 📥 จัดเก็บไฟล์ลงในกล่องหน่วยความจำ (BytesIO Object) แทนการเซฟลงดิสก์เครื่อง
-    excel_buffer = io.BytesIO()
-    wb.save(excel_buffer)
-    excel_buffer.seek(0)  # เลื่อนตัวชี้ตำแหน่งไฟล์กลับไปจุดเริ่มต้นเพื่อเริ่มอ่านส่งขึ้นคลาวด์
+    # Upload to GCS
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
 
-    # เจนเนอเรตชื่อไฟล์ที่ปลอดภัยและเป็นความลับด้วย UUID
-    secure_file_id = uuid.uuid4().hex
-    file_name = f"Report_{table_id}_{secure_file_id}.xlsx"
-    
+    file_id = uuid.uuid4().hex
+    filename = f"Report_{table_id}_{file_id}.xlsx"
+
     try:
-        # ☁️ จัดเตรียมปลายทางและอัปโหลดไฟล์สตรีมจาก RAM เข้าสู่ GCS Bucket
-        bucket = gcs_client.bucket(GCS_BUCKET_NAME)
-        blob = bucket.blob(file_name)
+        bucket = gcs_client.bucket(GCS_BUCKET)
+        blob = bucket.blob(filename)
         blob.upload_from_file(
-            excel_buffer, 
-            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            buffer,
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
-        logger.info(f"☁️ Successfully uploaded {file_name} to GCS bucket: {GCS_BUCKET_NAME}")
-        
-        # 🔗 ออกเอกสารสิทธิ์ลิงก์ดาวน์โหลดปลอดภัย (V4 Signed URL) อายุ 15 นาที
-        signed_url = blob.generate_signed_url(
-            version="v4", 
-            expiration=timedelta(minutes=15), 
-            method="GET"
-        )
-        return len(results), signed_url
-    except Exception as e:
-        logger.error(f"GCS Operations failed: {e}")
-        raise RuntimeError("เกิดข้อผิดพลาดในการบันทึกหรือออกลิงก์รายงานความปลอดภัยบน Cloud Storage")
 
-# --------------------------------------------------------
-# MCP Tools (สำหรับให้ Agent เรียกใช้งานผ่าน MCP Protocol)
-# --------------------------------------------------------
-@mcp.tool(
-    name="generate_excel_report",
-    description="สร้างไฟล์ Excel จากรายงานใน BigQuery และส่งลิงก์ดาวน์โหลดที่ปลอดภัยจาก GCS",
+        url = blob.generate_signed_url(
+            version="v4", expiration=timedelta(minutes=15), method="GET"
+        )
+        logger.info(f"✅ Uploaded: {filename}")
+        return len(results), url
+    except Exception as e:
+        logger.error(f"GCS upload failed: {e}")
+        raise
+
+
+# ============================================================================
+# FastAPI Setup
+# ============================================================================
+mcp = FastMCP("sc-report", stateless_http=True, json_response=True, host="0.0.0.0")
+mcp_app = mcp.streamable_http_app()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("=" * 70)
+    logger.info("🚀 SC Report Server Starting")
+    logger.info(f"   Project: {PROJECT_ID} | Dataset: {DATASET_ID} | Bucket: {GCS_BUCKET}")
+    init_clients()
+    async with mcp.session_manager.run():
+        logger.info("✅ All systems ready")
+        logger.info("=" * 70)
+        yield
+
+
+app = FastAPI(title="SC Report", version="2.0.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
-def mcp_generate_excel_report(
+
+
+@app.middleware("http")
+async def extract_user(request: Request, call_next):
+    user = None
+    for header in ["current-user", "current_user", "x-user-email"]:
+        if val := request.headers.get(header):
+            user = val
+            break
+    token = CURRENT_USERNAME.set(user)
+    try:
+        response = await call_next(request)
+    finally:
+        CURRENT_USERNAME.reset(token)
+    return response
+
+
+@app.get("/health")
+async def health():
+    """Health check endpoint"""
+    if not bq_client or not gcs_client:
+        return {"status": "initializing"}
+    return {"status": "healthy"}
+
+
+@app.post("/generate_excel_report")
+async def api_generate_report(req: GenerateReportRequest):
+    """REST endpoint for report generation"""
+    table = clean_table_id(req.table_id)
+    user = get_username(req.username, req.user_email)
+
+    if not user:
+        return {"success": False, "message": "No user"}
+    if "authenby" in table:
+        return {"success": False, "message": "Access denied"}
+    if not re.match(r"^[a-z0-9_]+$", table):
+        return {"success": False, "message": "Invalid table"}
+
+    report_name = check_permission(user, table)
+    if not report_name:
+        return {"success": False, "message": "No permission"}
+
+    try:
+        rows, url = generate_report(
+            table,
+            req.limit,
+            req.filter_column,
+            req.filter_value,
+            req.condition,
+        )
+        if not rows:
+            return {"success": False, "message": "No data"}
+        return {
+            "success": True,
+            "message": f"Report: {report_name}",
+            "rows": rows,
+            "url": url,
+        }
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        return {"success": False, "message": str(e)}
+
+
+@mcp.tool(name="generate_excel_report", description="Generate and download report")
+def mcp_generate_report(
     table_id: str,
     limit: int = 2000,
     filter_column: Optional[str] = None,
@@ -262,78 +375,41 @@ def mcp_generate_excel_report(
     user_email: Optional[str] = None,
     **kwargs,
 ) -> str:
-    username_to_use = resolve_username(username, user_email)
-    if not username_to_use: 
-        return "❌ ไม่พบข้อมูลยืนยันตัวตนในระบบ"
-    if "AuthenByMenu" in table_id.lower(): 
-        return "🔒 [Access Denied] ระบบไม่อนุญาตให้เข้าถึงตารางสิทธิ์ผู้ใช้งานผ่านช่องทางนี้"
-    if not validate_table_id(table_id): 
-        return "❌ table_id ไม่ถูกต้องตามระบบความปลอดภัย"
+    """MCP tool endpoint"""
+    table = clean_table_id(table_id)
+    user = get_username(username, user_email)
 
-    report_name = check_user_permission(username_to_use, table_id)
-    if not report_name: 
-        return f"🙏 ขออภัยครับ คุณไม่มีสิทธิ์เข้าถึงรายงานนี้"
+    if not user:
+        return "No user"
+    if "authenby" in table:
+        return "Access denied"
 
-    try:
-        row_count, signed_download_url = fetch_and_generate_excel_gcs(
-            table_id, limit, filter_column, filter_value, condition
-        )
-        if row_count is None: 
-            return f"❌ ไม่พบข้อมูลในรายงาน {report_name}"
-        
-        return (
-            f"📊 จัดเตรียม **รายงาน{report_name}** ({row_count} แถว) เรียบร้อยแล้วครับ\n"
-            f"🔗 ลิงก์ดาวน์โหลดปลอดภัย (ใช้งานได้ 15 นาที):\n{signed_download_url}"
-        )
-    except Exception as e:
-        return f"❌ เกิดข้อผิดพลาดในการทำงาน: {str(e)}"
-
-# --------------------------------------------------------
-# REST API Endpoints (ช่องทาง Webhook/HTTP ปกติ)
-# --------------------------------------------------------
-@app.post("/generate_excel_report")
-def generate_excel_report(request: GenerateReportRequest):
-    tid = clean_table_id(request.table_id)
-    username_val = resolve_username(request.username, request.user_email)
-
-    if not username_val: 
-        return {"success": False, "message": "❌ Unauthorized access. ไม่พบข้อมูลผู้ใช้"}
-    if "AuthenByMenu" in tid.lower(): 
-        return {"success": False, "message": "🔒 Access Denied: ตารางข้อมูลนี้เป็นความลับขั้นสูงของระบบ"}
-    if not validate_table_id(tid): 
-        return {"success": False, "message": f"❌ table_id '{tid}' ไม่ถูกต้อง"}
-
-    report_name = check_user_permission(username_val, tid)
-    if not report_name: 
-        return {"success": False, "message": "🙏 ขออภัย คุณไม่มีสิทธิ์เข้าถึงรายงานนี้"}
+    report_name = check_permission(user, table)
+    if not report_name:
+        return "No permission"
 
     try:
-        row_count, signed_download_url = fetch_and_generate_excel_gcs(
-            tid, 
-            limit=request.limit, 
-            filter_column=request.filter_column, 
-            filter_value=request.filter_value, 
-            condition=request.condition
-        )
-        if row_count is None: 
-            return {"success": False, "message": "❌ ไม่พบข้อมูลในระบบตารางรายงาน"}
-            
-        return {
-            "success": True, 
-            "message": f"✅ จัดเตรียม รายงาน{report_name} สำเร็จ", 
-            "download_url": signed_download_url
-        }
+        rows, url = generate_report(table, limit, filter_column, filter_value, condition)
+        if not rows:
+            return f"No data: {report_name}"
+        return f"✅ {report_name} ({rows} rows)\n🔗 {url}"
     except Exception as e:
-        return {"success": False, "message": f"🚨 Error: {str(e)}"}
+        return f"Error: {e}"
 
-# 🚨 สังเกต: เราลบแอปเร้าเตอร์ @app.get("/download/{file_name}") ออกไปแล้ว 
-# เพราะตอนนี้ Client สามารถยิงตรงหา GCS Gateway ด้วย Signed URL ได้อย่างปลอดภัยสูงสุด โดยไม่ต้องผ่านเซิร์ฟเวอร์เราซ้ำซ้อน
 
-app.mount("", mcp_asgi_app)
+app.mount("", mcp_app)
 
+
+# ============================================================================
+# Entry Point
+# ============================================================================
 if __name__ == "__main__":
     import uvicorn
-    # Cloud Run จะส่งค่า PORT มาให้ทาง Environment Variable (ค่าเริ่มต้นคือ 8080)
-    port = int(os.environ.get("PORT", 8080))
-    logger.info(f"Starting server on port {port}...")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+
+    logger.info("Starting uvicorn on 0.0.0.0:8080")
+    uvicorn.run(
+        "screportserver:app",
+        host="0.0.0.0",
+        port=8080,
+        log_level="info",
+    )
