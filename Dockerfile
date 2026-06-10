@@ -25,7 +25,7 @@ RUN python3 -c "import google.cloud.storage; print('✅ Storage')"
 RUN python3 -c "import fastapi; print('✅ FastAPI')"
 
 # Copy app
-COPY screport_min.py app.py
+COPY screportserver.py app.py
 
 # Health check
 HEALTHCHECK --interval=10s --timeout=5s --start-period=60s --retries=3 \
