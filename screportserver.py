@@ -186,7 +186,7 @@ def check_user_permission(username: str, table_id: str) -> Optional[str]:
     clean = clean_table_id(table_id).lower()
     
     # 🔒 [HARD SECURITY] บล็อกการเจาะระบบตรวจสอบสิทธิ์ผ่านช่องทางตาราง AuthenByMenu
-    if "authenbymenu" in clean:
+    if "AuthenByMenu" in clean:
         logger.warning(f"🚨 Security Blocked: User '{username}' tried to access permission table via check_user_permission")
         return None
 
@@ -237,7 +237,7 @@ def fetch_and_generate_excel(
     clean = clean_table_id(table_id).lower()
 
     # 🔒 [HARD SECURITY] บล็อกการดึงข้อมูลจากตารางสิทธิ์เด็ดขาดในระดับล่างสุด
-    if "authenbymenu" in clean:
+    if "AuthenByMenu" in clean:
         raise PermissionError("Access to the authentication table is strictly prohibited at code level.")
 
     bq_table_name = TABLE_TO_BQ_TABLE_NAME.get(clean, table_id)
@@ -346,7 +346,7 @@ def mcp_generate_excel_report(
     username_to_use = resolve_username(username, user_email)
     if not username_to_use:
         return "❌ ไม่พบข้อมูลยืนยันตัวตนในระบบ"
-    if "authenbymenu" in table_id.lower():
+    if "AuthenByMenu" in table_id.lower():
         return "🔒 [Access Denied] ระบบไม่อนุญาตให้เข้าถึงตารางสิทธิ์ผู้ใช้งานผ่านช่องทางนี้"
     if not validate_table_id(table_id):
         return "❌ table_id ไม่ถูกต้อง"
@@ -395,7 +395,7 @@ def generate_excel_report(request: GenerateReportRequest, background_tasks: Back
     if not username_val:
         return {"success": False, "message": "❌ Unauthorized access. ไม่พบข้อมูลผู้ใช้"}
 
-    if "authenbymenu" in tid.lower():
+    if "AuthenByMenu" in tid.lower():
         return {"success": False, "message": "🔒 Access Denied: ตารางข้อมูลนี้เป็นความลับขั้นสูงของระบบ"}
 
     if not validate_table_id(tid):
