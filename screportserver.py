@@ -330,3 +330,10 @@ def generate_excel_report(request: GenerateReportRequest):
 # เพราะตอนนี้ Client สามารถยิงตรงหา GCS Gateway ด้วย Signed URL ได้อย่างปลอดภัยสูงสุด โดยไม่ต้องผ่านเซิร์ฟเวอร์เราซ้ำซ้อน
 
 app.mount("", mcp_asgi_app)
+
+if __name__ == "__main__":
+    import uvicorn
+    # Cloud Run จะส่งค่า PORT มาให้ทาง Environment Variable (ค่าเริ่มต้นคือ 8080)
+    port = int(os.environ.get("PORT", 8080))
+    logger.info(f"Starting server on port {port}...")
+    uvicorn.run(app, host="0.0.0.0", port=port)
