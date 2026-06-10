@@ -9,7 +9,7 @@ RUN pip install --upgrade pip --no-cache-dir
 RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements
-COPY requirements_minimal.txt requirements.txt
+COPY requirements.txt requirements.txt
 
 # Install packages one by one to catch errors
 RUN echo "Installing google-cloud-bigquery..." && pip install --no-cache-dir google-cloud-bigquery==3.14.1
