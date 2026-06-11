@@ -5,3 +5,4 @@ mcp==1.27.1
 openpyxl==3.1.5
 google-cloud-bigquery==3.41.0
 pydantic
+google-cloud-firestore
