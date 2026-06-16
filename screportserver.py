@@ -775,6 +775,13 @@ def download_report(file_name: str, direct: bool = False):
     html_content = """<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Downloading...</title></head><body><script>const downloadUrl = window.location.pathname + "?direct=true";const iframe = document.createElement('iframe');iframe.style.display = 'none';iframe.src = downloadUrl;document.body.appendChild(iframe);setTimeout(() => { window.close(); }, 1000);</script></body></html>"""
     return HTMLResponse(content=html_content)
 
+# --------------------------------------------------------
+# Health Check Endpoint
+# --------------------------------------------------------
+@app.get("/health")
+def health_check():
+    return {"status": "healthy"}
+
 app.mount("", mcp_asgi_app)
 
 if __name__ == "__main__":
