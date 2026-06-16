@@ -8,7 +8,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 # 3. ก๊อปปี้โค้ดหลักเข้าไปรัน
-COPY screportserver.py .
+COPY screportserver.py mapping.py .
 # 4. เปิดพอร์ต 8080 มาตรฐานสำหรับ Google Cloud Run
 EXPOSE 8080
 # 5. สั่งสตาร์ท FastAPI ด้วย Uvicorn โดยใช้ PORT จาก Cloud Run
