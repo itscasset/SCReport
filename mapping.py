@@ -1,3 +1,5 @@
+import re
+
 # --------------------------------------------------------
 # Mapping Configuration
 # --------------------------------------------------------
@@ -12,6 +14,7 @@ TABLE_TO_REPORT_NAMES: dict[str, list[str]] = {
         "ทะเบียนคุมการเบิกจ่าย (ค่าใช้จ่าย)", "ทะเบียนคุมการเบิกจ่าย(ค่าใช้จ่าย)"
     ],
 }
+SENSITIVE_COLUMNS = {"username", "email"}
 
 TABLE_TO_BQ_TABLE_NAME: dict[str, str] = {
     "vrptexpension": "VRptExpension",
@@ -19,6 +22,9 @@ TABLE_TO_BQ_TABLE_NAME: dict[str, str] = {
 }
 
 ALLOWED_OPERATORS: set[str] = {"=", ">", "<", ">=", "<=", "LIKE", "!="}
+# ✅ รองรับ Username ที่มีช่องว่าง เช่น "Rattanachote Petpansri" และอักษรไทย
+USER_REGEX = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$|^[a-zA-Z0-9\u0E00-\u0E7F _.-]{2,80}$")
+BQ_TABLE_REGEX = re.compile(r"^[A-Za-z0-9_.-]+$")
 # --------------------------------------------------------
 # 🔥 Full Hardcoded Mappingแยกตารางอย่างสมบูรณ์แบบ (รวม 118 คอลัมน์)
 # --------------------------------------------------------
