@@ -60,7 +60,7 @@ class TotalCost:
 def calculate_bigquery_cost(
     bytes_billed: int,
     price_per_tb_usd: float = BQ_PRICE_PER_TB_USD,
-    usd_to_thb: float = 35.0,
+    usd_to_thb: float = 32.57,
 ) -> BigQueryCost:
     safe_bytes = max(int(bytes_billed), 0)
     tb_billed = safe_bytes / (1024 ** 4)
@@ -80,7 +80,7 @@ def calculate_cloud_run_cost(
     request_price_per_million: float = CLOUD_RUN_REQUEST_PRICE_PER_M,
     cpu_price_per_vcpu_sec: float = CLOUD_RUN_CPU_PRICE_PER_VCPU_SEC,
     mem_price_per_gib_sec: float = CLOUD_RUN_MEM_PRICE_PER_GIB_SEC,
-    usd_to_thb: float = 35.0,
+    usd_to_thb: float = 32.57,
 ) -> CloudRunCost:
     billable_seconds = max(math.ceil(duration_seconds * 10) / 10, 0.1)
     request_cost_usd = request_price_per_million / 1_000_000
@@ -104,7 +104,7 @@ def calculate_total_cost(
     duration_seconds: float,
     vcpu: float = 1.0,
     memory_gib: float = 0.5,
-    usd_to_thb: float = 35.0,
+    usd_to_thb: float = 32.57,
     bq_price_per_tb_usd: float = BQ_PRICE_PER_TB_USD,
 ) -> TotalCost:
     bq = calculate_bigquery_cost(bytes_billed, bq_price_per_tb_usd, usd_to_thb)
@@ -163,7 +163,7 @@ PUBLIC_BASE_URL = os.environ.get(
     "https://sc-report-866803019306.asia-southeast3.run.app",
 )
 
-COST_USD_TO_THB = float(os.environ.get("COST_USD_TO_THB", "35.0"))
+COST_USD_TO_THB = float(os.environ.get("COST_USD_TO_THB", "32.57"))
 COST_CLOUD_RUN_VCPU = float(os.environ.get("COST_CLOUD_RUN_VCPU", "1.0"))
 COST_CLOUD_RUN_MEM_GIB = float(os.environ.get("COST_CLOUD_RUN_MEM_GIB", "0.5"))
 
@@ -320,7 +320,7 @@ class CostEstimateRequest(BaseModel):
     duration_seconds: float = Field(..., gt=0, description="เวลา request รวม (วินาที)")
     vcpu: float = Field(default=1.0, gt=0, description="vCPU ที่ Cloud Run ใช้")
     memory_gib: float = Field(default=0.5, gt=0, description="Memory (GiB) ที่ Cloud Run ใช้")
-    usd_to_thb: float = Field(default=35.0, gt=0, description="อัตราแลกเปลี่ยน USD→THB")
+    usd_to_thb: float = Field(default=32.57, gt=0, description="อัตราแลกเปลี่ยน USD→THB")
 
 # ============================================================
 # SECTION 9 — HELPERS & SECURITY (UPDATED)
