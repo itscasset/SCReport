@@ -156,7 +156,7 @@ BANGKOK_TZ = ZoneInfo("Asia/Bangkok")
 PROJECT_ID = os.environ.get("PROJECT_ID", "sc-ai-uat")
 DATASET_ID = os.environ.get("DATASET_ID", "SCReport")
 AUTH_TABLE = os.environ.get("AUTH_TABLE", "AuthenByMenu")
-LOG_TABLE = os.environ.get("LOG_TABLE", "AiLog")
+LOG_TABLE = os.environ.get("LOG_TABLE", "AiLog")  # ย้ายกลับไปใช้ AiLog ตามเดิม
 DEFAULT_USERNAME = ""
 PUBLIC_BASE_URL = os.environ.get(
     "PUBLIC_BASE_URL",
@@ -170,13 +170,14 @@ COST_CLOUD_RUN_MEM_GIB = float(os.environ.get("COST_CLOUD_RUN_MEM_GIB", "0.5"))
 CLEANUP_SECRET = os.environ.get("CLEANUP_SECRET", "super-secret-sc-cleanup-2025")
 
 # ============================================================
-# SECTION 3 — MAPPING
+# SECTION 3 — MAPPING & FIRESTORE
 # ============================================================
+from google.cloud import firestore
+
 from mapping import (
     TABLE_TO_REPORT_NAMES,
     TABLE_TO_BQ_TABLE_NAME,
     ALLOWED_OPERATORS,
-    TABLE_COLUMN_MAPPING,
     USER_REGEX,
     BQ_TABLE_REGEX,
     SENSITIVE_COLUMNS,
@@ -186,8 +187,58 @@ REPORT_DIR = Path("/tmp/reports").resolve()
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 bq_client = bigquery.Client(project=PROJECT_ID)
+firestore_client = firestore.Client(project=PROJECT_ID)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("SCReportSecurity")
+
+# In-memory cache for firestore table mappings
+# Structure: { table_name: (mapping_dict, expiry_time) }
+_MAPPING_CACHE: dict[str, tuple[dict[str, str], datetime]] = {}
+CACHE_TTL = timedelta(minutes=5)
+
+def get_table_column_mapping(table_id: str) -> dict[str, str]:
+    """
+    ดึงข้อมูล Column Translation Mapping จาก Firestore dynamic metadata
+    path: data_dictionary/{DATASET_ID}/tables/{bq_table_name}
+    """
+    cleaned_table = clean_table_id(table_id)
+    short_name = extract_short_table_name(cleaned_table)
+    bq_table_name = TABLE_TO_BQ_TABLE_NAME.get(short_name, cleaned_table)
+
+    now = datetime.now(timezone.utc)
+    if bq_table_name in _MAPPING_CACHE:
+        mapping, expiry = _MAPPING_CACHE[bq_table_name]
+        if now < expiry:
+            return mapping
+
+    # Fetch from Firestore
+    try:
+        doc_ref = (
+            firestore_client.collection("data_dictionary")
+            .document(DATASET_ID)
+            .collection("tables")
+            .document(bq_table_name)
+        )
+        doc = doc_ref.get()
+        mapping = {}
+        if doc.exists:
+            data = doc.to_dict() or {}
+            columns_list = data.get("columns", [])
+            for col in columns_list:
+                name = col.get("name")
+                desc = col.get("description")
+                if name:
+                    # Fallback to column name if description is empty or None
+                    mapping[name] = desc if desc else name
+            logger.info(f"✨ [Firestore] Loaded mapping for '{bq_table_name}' with {len(mapping)} columns.")
+        else:
+            logger.warning(f"⚠️ [Firestore] Document data_dictionary/{DATASET_ID}/tables/{bq_table_name} does not exist.")
+            
+        _MAPPING_CACHE[bq_table_name] = (mapping, now + CACHE_TTL)
+        return mapping
+    except Exception as e:
+        logger.error(f"❌ Error fetching column mapping from Firestore: {e}", exc_info=True)
+        return {}
 
 CURRENT_REQUEST_USERNAME: ContextVar[Optional[str]] = ContextVar(
     "current_request_username", default=None
@@ -258,17 +309,6 @@ app.add_middleware(
 # SECTION 7 — MIDDLEWARE
 # ============================================================
 @app.middleware("http")
-async def preserve_method_on_redirect(request: Request, call_next):
-    response = await call_next(request)
-    if response.status_code == 302 and request.method in ("POST", "PUT", "PATCH", "DELETE"):
-        location = response.headers.get("location", "")
-        logger.info(
-            f"🔀 [RedirectFix] 302→307 {request.method} {request.url.path} → {location}"
-        )
-        response.status_code = 307
-    return response
-
-@app.middleware("http")
 async def capture_username_header(request: Request, call_next):
     username_val = None
     for header_name in ["current-user", "current_user", "x-user-email"]:
@@ -277,7 +317,9 @@ async def capture_username_header(request: Request, call_next):
             username_val = val
             break
 
-    masked_user = mask_username(username_val)
+    # Flag to disable masking for debugging
+    show_raw = os.getenv("SHOW_RAW_EMAIL", "false").lower() == "true"
+    masked_user = username_val if show_raw else mask_username(username_val)
     logger.info(
         f"📨 [Middleware] {request.method} {request.url.path} | User: {masked_user}"
     )
@@ -292,6 +334,20 @@ async def capture_username_header(request: Request, call_next):
     finally:
         CURRENT_REQUEST_USERNAME.reset(token_username)
         CURRENT_REQUEST_BASE_URL.reset(token_base)
+
+# Block GET /mcp (SSE long-poll) เพื่อป้องกัน client เปิด SSE stream ค้างไว้
+# POST /mcp ยังทำงานปกติสำหรับ Streamable HTTP stateless
+@app.middleware("http")
+async def block_sse_stream(request: Request, call_next):
+    if request.method == "GET" and request.url.path.rstrip("/") in ("/mcp", "/mcp/sse"):
+        from starlette.responses import JSONResponse
+        return JSONResponse(
+            status_code=405,
+            content={"detail": "SSE transport is disabled. Use POST /mcp for Streamable HTTP."},
+            headers={"Retry-After": "3600"},
+        )
+    return await call_next(request)
+
 
 # ============================================================
 # SECTION 8 — PYDANTIC MODELS
@@ -437,12 +493,10 @@ def check_user_permission(username: str, table_id: str) -> Optional[str]:
 def validate_filter_column(table_id: str, column: str) -> bool:
     if not table_id or not column:
         return False
-    short_name = extract_short_table_name(table_id)
-    mapping_dict = TABLE_COLUMN_MAPPING.get(short_name, {})
+    mapping_dict = get_table_column_mapping(table_id)
     target_column = column.lower()
     return any(k.lower() == target_column for k in mapping_dict.keys())
 
-# เพิ่มตัวแปรสำหรับรับค่าข้อมูลเงินแยกตาม Schema ใหม่ของตาราง AiLog
 def insert_ai_log(
     username: str,
     table_name: str,
@@ -472,15 +526,15 @@ def insert_ai_log(
                 "TableName": (table_name or "")[:50],
                 "ReportName": (report_name or "")[:100],
                 "Status": (status or "")[:15],
-                "Condition": (condition or "")[:2000], # จุดนี้จะใช้เก็บ SQL Statement จริง
+                "Condition": (condition or "")[:2000], 
                 "Size": round(size, 4),
                 "BytesBilled": bytes_billed,
                 "URL": (url or "")[:1000],
                 "Row_generated": row_generated,
                 "AiLogID": ai_log_id,
-                "CostTHB": round(cost_thb, 6),        # บันทึกยอดรวมเงินบาทลงตาราง
-                "CostUSD": round(cost_usd, 8),        # บันทึกยอดรวมดอลลาร์ลงตาราง
-                "CostSummary": (cost_summary or "")[:500], # เก็บบันทึกตัวหนังสือย่อยของ Cloud Run และ BQ
+                "CostTHB": round(cost_thb, 6),        
+                "CostUSD": round(cost_usd, 8),        
+                "CostSummary": (cost_summary or "")[:500], 
             }
         ]
         full_table = f"{PROJECT_ID}.{DATASET_ID}.{LOG_TABLE}"
@@ -579,7 +633,6 @@ def fetch_and_generate_excel(
     safe_limit = min(max(limit, 1), 50000)
     query += f" LIMIT {safe_limit}"
 
-    # บันทึกตัวแปรภาษา SQL แท้เพื่อนำไปใช้งานต่อในช่อง Condition ของ Log
     actual_sql_executed = query
 
     job_config = bigquery.QueryJobConfig(query_parameters=params)
@@ -594,11 +647,10 @@ def fetch_and_generate_excel(
         ai_log_id = generate_ai_log_id()
         return 0, None, bytes_billed, 0.0, actual_sql_executed, ai_log_id
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Report"
+    wb = Workbook(write_only=True)          
+    ws = wb.create_sheet(title="Report")
 
-    raw_mapping = TABLE_COLUMN_MAPPING.get(short_name, {})
+    raw_mapping = get_table_column_mapping(table_id)
     lowercase_mapping = {k.lower(): v for k, v in raw_mapping.items()}
 
     headers = []
@@ -635,63 +687,38 @@ def cleanup_old_reports() -> None:
     cleanup_age_seconds = int(os.environ.get("CLEANUP_AGE_SECONDS", "86400"))
     cleanup_max_files = int(os.environ.get("CLEANUP_MAX_FILES", "20"))
     
-    logger.info(f"🧹 Starting cleanup: strategy={cleanup_strategy}, age_threshold={cleanup_age_seconds}s, max_files={cleanup_max_files}")
-    
+    logger.info(f"放置 Cleanup: strategy={cleanup_strategy}")
     if not REPORT_DIR.exists():
-        logger.info(f"🧹 Report directory does not exist: {REPORT_DIR}")
         return
-    
-    deleted = 0
+        
     current_time = time.time()
+    deleted = 0
     
-    try:
-        if cleanup_strategy == "age":
-            cutoff_timestamp = current_time - cleanup_age_seconds
-            for file_path in REPORT_DIR.glob("*.xlsx"):
-                try:
-                    if file_path.is_file():
-                        file_mtime = file_path.stat().st_mtime
-                        file_age_seconds = current_time - file_mtime
-                        if file_mtime < cutoff_timestamp:
-                            file_path.unlink()
-                            deleted += 1
-                            logger.info(f"✓ Deleted: {file_path.name} (age: {file_age_seconds:.1f}s)")
-                except FileNotFoundError:
-                    pass
-                except Exception as file_error:
-                    logger.warning(f"⚠️ Skipped '{file_path.name}' due to error: {file_error}")
-        
-        elif cleanup_strategy == "keep_latest":
-            files = sorted(REPORT_DIR.glob("*.xlsx"), key=lambda p: p.stat().st_mtime, reverse=True)
-            for file_path in files[cleanup_max_files:]:
-                try:
-                    if file_path.is_file():
-                        file_path.unlink()
-                        deleted += 1
-                        logger.info(f"✓ Deleted old file: {file_path.name}")
-                except FileNotFoundError:
-                    pass
-                except Exception as file_error:
-                    logger.warning(f"⚠️ Skipped '{file_path.name}': {file_error}")
-        
-        elif cleanup_strategy == "aggressive":
-            for file_path in REPORT_DIR.glob("*.xlsx"):
-                try:
-                    if file_path.is_file():
-                        file_path.unlink()
-                        deleted += 1
-                        logger.info(f"✓ Deleted: {file_path.name}")
-                except FileNotFoundError:
-                    pass
-                except Exception as file_error:
-                    logger.warning(f"⚠️ Skipped '{file_path.name}': {file_error}")
-        
-        if deleted > 0:
-            logger.info(f"🧹 Cleanup completed — {deleted} file(s) removed (strategy: {cleanup_strategy})")
-        else:
-            logger.info(f"🧹 Cleanup completed but no files were deleted")
-    except Exception as e:
-        logger.error(f"❌ Cleanup failed with error: {e}", exc_info=True)
+    if cleanup_strategy not in ["age", "keep_latest", "aggressive"]:
+        logger.warning(f"⚠️ Unknown strategy '{cleanup_strategy}'. Fallback to 'age'.")
+        cleanup_strategy = "age"
+
+    if cleanup_strategy == "age":
+        cutoff = current_time - cleanup_age_seconds
+        for file_path in REPORT_DIR.glob("*.xlsx"):
+            if file_path.is_file() and file_path.stat().st_mtime < cutoff:
+                file_path.unlink()
+                deleted += 1
+                
+    elif cleanup_strategy == "keep_latest":
+        files = sorted(REPORT_DIR.glob("*.xlsx"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for file_path in files[cleanup_max_files:]:
+            if file_path.is_file():
+                file_path.unlink()
+                deleted += 1
+                
+    elif cleanup_strategy == "aggressive":
+        for file_path in REPORT_DIR.glob("*.xlsx"):
+            if file_path.is_file():
+                file_path.unlink()
+                deleted += 1
+
+    logger.info(f"🧹 Cleanup completed — {deleted} file(s) removed.")
 
 # ============================================================
 # SECTION 12 — CENTRALIZED REPORT GENERATION (UPDATED WITH ADVANCED COST LOGGING)
@@ -730,7 +757,6 @@ def _execute_report_generation(
         return {"success": False, "message": "🙏 ขออภัย คุณไม่มีสิทธิ์เข้าถึงรายงานนี้"}
 
     try:
-        # รับค่า actual_sql ออกมาจากตัวแปรลำดับที่ 5
         row_count, file_name, bytes_billed, file_size_mb, actual_sql, ai_log_id = (
             fetch_and_generate_excel(
                 tid, report_name, limit,
@@ -763,7 +789,6 @@ def _execute_report_generation(
         base_url = CURRENT_REQUEST_BASE_URL.get() or PUBLIC_BASE_URL
         download_url = f"{base_url.rstrip('/')}/download/{file_name}"
 
-        # ส่งข้อมูลลงคอลัมน์ใหม่อย่างครบถ้วน และใช้ Condition เก็บ SQL แท้แทน
         insert_ai_log(
             username=username_to_use,
             table_name=bq_table_name,

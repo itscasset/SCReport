@@ -1,0 +1,17 @@
+{
+  "bindings": [
+    {
+      "members": [
+        "user:kachatharn@scasset.com"
+      ],
+      "role": "roles/bigquery.admin"
+    },
+    {
+      "members": [
+        "serviceAccount:sc-report-bot@sc-ai-uat.iam.gserviceaccount.com",
+        "user:kachatharn@scasset.com"
+      ],
+      "role": "roles/bigquery.dataEditor"
+    }
+  ]
+}
