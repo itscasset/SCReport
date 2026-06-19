@@ -4,7 +4,7 @@ An asynchronous REST API and **Model Context Protocol (MCP)** server built to au
 
 ---
 
-## 🛠️ Technology Stack & Why We Used Them
+## Technology Stack & Why We Used Them
 
 | Technology | Role | Why It Was Chosen |
 | :--- | :--- | :--- |
@@ -19,7 +19,7 @@ An asynchronous REST API and **Model Context Protocol (MCP)** server built to au
 
 ---
 
-## ⚙️ How It Works (System Architecture & Flow)
+## How It Works (System Architecture & Flow)
 
 The application coordinates authorization, schema translation, query execution, report creation, and audit logging in a pipeline:
 
@@ -69,7 +69,7 @@ graph TD
 
 ---
 
-## 🚀 API Endpoints & MCP Tools
+## API Endpoints & MCP Tools
 
 ### REST HTTP Endpoints
 - `POST /generate_excel_report`: Accepts details on columns, filters, and limit, validates permission, and generates the Excel file.
@@ -85,7 +85,7 @@ graph TD
 
 ---
 
-## 🛠️ Environment Variables Config
+## Environment Variables Config
 
 Set these variables in your deployment environment (e.g., Cloud Run or Docker):
 
@@ -111,16 +111,16 @@ Set these variables in your deployment environment (e.g., Cloud Run or Docker):
 ## 🤝 Technical Support & Troubleshooting
 
 ### Common Error Responses
-1. **`❌ ไม่พบข้อมูลยืนยันตัวตนในระบบ` (No Auth Context)**
+1. **`ไม่พบข้อมูลยืนยันตัวตนในระบบ` (No Auth Context)**
    - **Cause:** The request header (e.g., `x-user-email` or `current-user`) was not sent.
    - **Solution:** Ensure your client/front-end forwards user information in headers.
-2. **`🙏 ขออภัย คุณไม่มีสิทธิ์เข้าถึงรายงานนี้` (Access Denied)**
+2. **`ขออภัย คุณไม่มีสิทธิ์เข้าถึงรายงานนี้` (Access Denied)**
    - **Cause:** The username has no authorization record mapping to that table in the `AuthenByMenu` BigQuery table.
    - **Solution:** Add the matching `UserName` and `ReportName` entry in BigQuery.
-3. **`❌ table_id '<name>' ไม่ถูกต้อง` (Invalid Table Format)**
+3. **`table_id '<name>' ไม่ถูกต้อง` (Invalid Table Format)**
    - **Cause:** Table ID has invalid characters or doesn't follow regex checks.
    - **Solution:** Ensure the table ID matches `[DatasetName].[TableName]` format.
-4. **`❌ ไม่พบข้อมูลในรายงาน` (Empty Report)**
+4. **`ไม่พบข้อมูลในรายงาน` (Empty Report)**
    - **Cause:** BigQuery query returned 0 rows for the specified filters.
 
 ### Log Auditing
