@@ -1,9 +1,0 @@
-INIT INSPECT
-Imported firestore
-Created client
-Called collections()
-Found 2 collections
-- data_dictionary
-- data_groups
-  Document ID: SCNUMBERS
-  Data: {'tables': [{'table': 'plan', 'dataset': 'scnumbers_transaction'}, {'table': 'presale', 'dataset': 'scnumbers_transaction'}, {'table': 'project', 'dataset': 'scnumbers_transaction'}, {'table': 'transfer', 'dataset': 'scnumbers_transaction'}], 'updated_at': DatetimeWithNanoseconds(2026, 5, 29, 12, 38, 27, 141966, tzinfo=datetime.timezone.utc), 'description': '\n# Database & Query Logic\n1. ยอดโอน / รายได้ / Transfer / Backlog ให้ดึงข้อมูลจากตาราง `scnumbers_transaction.transfer` โดย "วันที่โอน" ให้ดูจาก `transfer.transfer_date`,  "Backlog" ให้ดึงเดือนจาก `transfer.est_transfer_month` และต้องทำการ Filter Partition จาก `date_id` ทุกครั้ง\n\n2. ยอดจอง / ขาย (Presales):\xa0\n\xa0\xa0 - ดึงข้อมูลจากตาราง `scnumbers_transaction.presale`\n\xa0 - ให้ filter ด้วย `presale.trans_date` และให้ Partition จาก `date_id` ทุกครั้ง\n- จำนวน unit ขาย ให้ filter\xa0 `presale.trans_type` = ราคาขาย\n\n3. เงื่อนไขเวลา (Time Filtering):\n\xa0\xa0 - ยอดของเดือนนั้นๆ (Monthly): ให้เลือกเฉพาะแถวที่ `date_id` มีค่าสูงสุดของเดือนนั้น (Latest record of the month)\n\xa0\xa0 - ยอดปัจจุบัน/รวมทั้งปี (YTD): ให้กรองเอาเฉพาะแถวที่ `date_id` มีค่าสูงสุดของปี (Latest record of the year) จากทั้งตารางเพียงค่าเดียว\n\n4. โครงการที่เปิดขายหรือโครงการที่โอน ให้ไปดึงข้อมูลจากตาราง `scnumbers_transaction.plan` และให้ filter ด้วย year_plan', 'name': 'SCNUMBERS'}
