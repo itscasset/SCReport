@@ -5,7 +5,7 @@ DATASET_ID = "SCReport"
 AUTH_TABLE = "AuthenByMenu"
 bq_client = bigquery.Client(project=PROJECT_ID)
 
-email = "rattanachote@scasset.com"
+email = ""
 report_names = [
     "รายงานตรวจสอบการจ่ายเงิน (ต้นทุน)",
     "รายงานตรวจสอบการจ่ายเงิน(ต้นทุน)",
