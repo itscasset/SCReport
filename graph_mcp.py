@@ -87,6 +87,7 @@ def run_code(
     code_str: str,
     df: pd.DataFrame | None = None,
     output_png_path: str | None = None,
+    column_labels: dict | None = None,   # ← เพิ่ม
     timeout: float = 15.0
 ) -> dict:
     """
@@ -96,14 +97,16 @@ def run_code(
         code_str       : โค้ด Python ที่ต้องการรัน (string)
         df             : pandas DataFrame (optional) — ถ้าส่งมา จะสามารถใช้ชื่อ `df` หรือ `data` ในโค้ดได้เลย
         output_png_path: พาธสำหรับเซฟรูปภาพ (optional) — ถ้าไม่ส่งมา จะไม่พยายามเซฟรูป
+        column_labels  : dict mapping original column name → Thai description (optional)
+                         inject เป็นตัวแปร `column_labels` ใน sandbox ให้ใช้ rename axis label
         timeout        : เวลาสูงสุดในการรัน (วินาที, default 15)
 
     ผลลัพธ์ที่ return:
         {
             "success": bool,
-            "output":  str,   # stdout ที่ได้จากการรัน
-            "message": str,   # ข้อความสำเร็จ/error
-            "has_image": bool # ถ้าสร้างภาพได้จริง จะเป็น True
+            "output":  str,
+            "message": str,
+            "has_image": bool
         }
     """
     # Step 1: Security check
@@ -124,7 +127,6 @@ def run_code(
     has_png = output_png_path is not None
 
     try:
-        # Save dataframe to pickle only if provided
         df_load_lines = ""
         if df is not None:
             df.to_pickle(pkl_path)
@@ -135,7 +137,13 @@ df = _pd.read_pickle("{posix_pkl_path}")
 data = df
 """
 
-        # Build save-plot lines only if output path is given
+        # ← inject column_labels ถ้ามี
+        column_labels_line = ""
+        if column_labels:
+            column_labels_line = f"column_labels = {repr(column_labels)}\n"
+        else:
+            column_labels_line = "column_labels = {}\n"
+
         posix_png = Path(output_png_path).as_posix() if has_png else ""
         save_plot_lines = ""
         if has_png:
@@ -168,7 +176,7 @@ import pprint
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.font_manager as fm
-fm._load_fontmanager(try_read_cache=False)  # ← force rebuild font cache
+fm._load_fontmanager(try_read_cache=False)
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 import matplotlib.cm as cm
@@ -183,7 +191,7 @@ matplotlib.rcParams['font.sans-serif'] = [
 matplotlib.rcParams['axes.unicode_minus'] = False
 
 {df_load_lines}
-
+{column_labels_line}
 # ---- Run user code ----
 {code_str}
 
@@ -220,7 +228,6 @@ matplotlib.rcParams['axes.unicode_minus'] = False
                 "has_image": image_created,
             }
 
-        # Error case
         stderr = result.stderr or ""
         error_lines = stderr.strip().split("\n")
         err_msg = error_lines[-1] if error_lines else "Unknown error in code execution."
@@ -267,6 +274,7 @@ def run_visualization_code(
     df: pd.DataFrame,
     code_str: str,
     output_png_path: str,
+    column_labels: dict | None = None,   # ← เพิ่ม
     timeout: float = 10.0,
 ) -> dict:
     """
@@ -277,9 +285,9 @@ def run_visualization_code(
         code_str=code_str,
         df=df,
         output_png_path=output_png_path,
+        column_labels=column_labels,     # ← pass through
         timeout=timeout,
     )
-    # แปลง format กลับให้ตรงกับของเดิม
     return {
         "success": res["success"],
         "message": res["message"],

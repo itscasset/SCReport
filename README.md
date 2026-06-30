@@ -1,6 +1,6 @@
-# SC Report Server & MCP API
+# SC Report Server & MCP API (GCS Integrated)
 
-An asynchronous REST API and **Model Context Protocol (MCP)** server built to authorize users, query BigQuery databases, dynamically translate columns using Firestore metadata, generate secure Excel reports, render visual charts via a secure sandbox, and log execution usage with detailed cost analysis.
+An asynchronous REST API and **Model Context Protocol (MCP)** server built to authorize users, query BigQuery databases, dynamically translate columns using Firestore metadata, generate secure Excel reports, render visual charts via a secure sandbox, store generated assets in **Google Cloud Storage (GCS)**, and log execution usage with detailed cost analysis.
 
 ---
 
@@ -12,6 +12,7 @@ An asynchronous REST API and **Model Context Protocol (MCP)** server built to au
 | **FastAPI** | Web Framework | Extremely fast, built on ASGI standards (allowing asynchronous calls), automatic Swagger/Redoc UI documentation, and native support for Pydantic. |
 | **FastMCP** | Model Context Protocol | Exposes functions as tools for Large Language Models (LLMs), allowing AI agents to interact with our BigQuery and report/chart generation pipelines directly. |
 | **Google Cloud BigQuery** | Data Warehouse | Scalable, highly performant analysis of petabyte-scale datasets. Direct SDK integration enables quick querying and cost tracking. |
+| **Google Cloud Storage (GCS)** | Object Storage | Used to store generated Excel reports and PNG charts securely. Replaces local ephemeral storage, enabling multi-instance deployment and secure signed URL sharing. |
 | **Google Cloud Firestore** | NoSQL Database | Used to store dynamic metadata (data dictionary / column translations) with a 5-minute TTL memory cache. Faster and more flexible than storing static files or schemas. |
 | **openpyxl** | Excel Generation | Used in `write-only` mode (`Workbook(write_only=True)`) to append rows efficiently, ensuring very low memory footprints even with large datasets. |
 | **Matplotlib & Seaborn** | Data Visualization | Generates publication-quality charts and graphs directly from BigQuery pandas DataFrames. |
@@ -23,7 +24,7 @@ An asynchronous REST API and **Model Context Protocol (MCP)** server built to au
 
 ## How It Works (System Architecture & Flow)
 
-The application coordinates authorization, schema translation, query execution, report/chart creation, and audit logging in a pipeline:
+The application coordinates authorization, schema translation, query execution, report/chart creation, GCS upload, and audit logging in a pipeline:
 
 ```mermaid
 graph TD
@@ -39,19 +40,21 @@ graph TD
     H -- Generate Excel --> I[Construct Safe Parametrized BQ SQL Query]
     I --> J[Execute BigQuery Job & Fetch Data]
     J --> K[Stream Data into openpyxl Workbook]
-    K --> L[Save Excel to /tmp/reports with Secure Hash Name]
+    K --> L[Save Excel to /tmp/reports staging]
+    L --> L2[Upload to GCS Bucket & Delete Local File]
     
     %% Chart Generation Path
     H -- Generate Chart --> M[AST Security Scan on Plotting Code]
     M -- Unsafe Code --> N[Raise Security Error / Log FAIL_CHART]
     M -- Safe Code --> O[Execute BigQuery Job & Load DataFrame]
     O --> P[Run Plotting Code in Isolated Sandbox Subprocess]
-    P --> Q[Save Chart PNG to /tmp/reports with Secure Hash Name]
+    P --> Q[Save Chart PNG to /tmp/reports staging]
+    Q --> Q2[Upload to GCS Bucket & Delete Local File]
     
-    L --> R[Calculate BigQuery & Cloud Run Resource Cost]
-    Q --> R
+    L2 --> R[Calculate BigQuery & Cloud Run Resource Cost]
+    Q2 --> R
     R --> S[Insert Record to BigQuery AiLog Table]
-    S --> T[Return Download Link & Cost Summary]
+    S --> T[Return GCS Signed URL / Download Link & Cost Summary]
 ```
 
 ### 1. User Context & Middleware
@@ -81,14 +84,11 @@ When generating charts, users or agents provide a Python plotting script. To pre
   - Dangerous property/magic attribute access (e.g., `__class__`, `__dict__`) is strictly forbidden.
 - **Isolated Subprocess:** The verified script runs in an isolated subprocess with a 15-second timeout and clean environment variables (e.g., stripping database credentials and secrets).
 
-### 6. Report Generation & Cost Estimation
-- **Excel Stream:** Data is queried and written as a stream into an `.xlsx` workbook using `openpyxl` in write-only mode to conserve RAM.
+### 6. GCS Storage & Report Generation
+- **Excel Stream:** Data is queried and written into an `.xlsx` workbook using `openpyxl` in write-only mode to conserve RAM.
 - **Chart Plotting:** Data is loaded into a pandas DataFrame, plotted using the user's secure Python script, and rendered as a `.png` file.
-- **Temporary Storage:** Files are saved under `/tmp/reports/` with a secure hashed filename layout containing the table name, a secure 8-character random hash, and a timestamp.
-- **Cost Engine:** The system calculates:
-    - **BigQuery cost** based on billed bytes ($6.25 per TB).
-    - **Cloud Run cost** based on virtual CPU (vCPU), memory (GiB) allocations, and request duration.
-    - Converts the total cost from USD to THB using configurable exchange rates.
+- **GCS Upload & Staging:** Files are temporarily saved under `/tmp/reports/` with a secure hashed filename, uploaded immediately to Google Cloud Storage, and then deleted from the local disk.
+- **Cost Engine:** The system calculates BigQuery cost ($6.25 per TB) and Cloud Run compute costs, converting the total to THB.
 - **Audit Logging:** Every query status (`OK`, `FAIL`, `FAIL_CHART`), generated size, row count, execution SQL query, and calculated costs are recorded in the `AiLog` BigQuery table.
 
 ---
@@ -97,19 +97,21 @@ When generating charts, users or agents provide a Python plotting script. To pre
 
 ### REST HTTP Endpoints
 
-- `POST /generate_excel_report`: Accepts details on columns, filters, and limit, validates permission, and generates the Excel file.
-- `POST /generate_chart_report`: Accepts BigQuery table details, filters, and a Python plotting script (`code`), validates script safety via AST, runs the plotting script in the sandbox, and generates a `.png` chart.
+- `POST /generate_excel_report`: Accepts details on columns, filters, and limit, validates permission, and generates the Excel file (uploaded to GCS).
+- `POST /generate_chart_report`: Accepts BigQuery table details, filters, and a Python plotting script (`code`), validates script safety via AST, runs the plotting script in the sandbox, and generates a `.png` chart (uploaded to GCS).
 - `POST /cost_estimate`: Mock-calculates pricing breakdowns for custom bytes and run durations.
-- `GET /download/{file_name}`: Securely serves generated `.xlsx` sheets and `.png` charts (wrapped inside an auto-closing iframe to protect paths, unless `direct=true` is appended).
-- `GET /files` or `GET /file`: Renders a premium, visual **File Manager UI** in dark mode with glassmorphism styling. Features include:
+- `GET /download/{file_name}`:
+  - **Default (`direct=false`):** Returns a JSON response containing a secure GCS v4 signed URL and its expiration time.
+  - **Direct (`direct=true`):** Streams the file directly from GCS via HTTP `StreamingResponse` (useful for downloading or inline image rendering).
+- `GET /files` or `GET /file`: Renders a premium, visual **File Manager UI** in dark mode with glassmorphism styling, showing files stored in GCS. Features include:
   - Live search bar to filter files dynamically.
-  - Action buttons to View, Download, or Delete individual files.
-  - Live thumbnail previews and interactive image viewing modals for generated charts.
-  - **Clean up trigger:** A button to manually clear junk/expired files.
+  - Action buttons to View, Download, or Delete individual GCS files.
+  - Live GCS thumbnail previews and interactive image viewing modals for generated charts.
+  - **Clean up trigger:** A button to manually clear junk/expired files in GCS.
   - *Note: Returns JSON format if the request header doesn't accept HTML or if `format=json` is appended.*
-- `DELETE /files/{file_name}`: Securely deletes a specific generated file.
-- `POST /internal/cleanup`: Manually deletes expired reports. Securely authorized using a `X-Cleanup-Token` header.
-- `GET /health`: Simple health-check endpoint.
+- `DELETE /files/{file_name}`: Securely deletes a specific file from GCS.
+- `POST /internal/cleanup`: Manually deletes expired GCS files. Securely authorized using a `X-Cleanup-Token` header.
+- `GET /health`: Simple health-check endpoint (returns GCS status and bucket name).
 
 ### Model Context Protocol (MCP) Tools
 
@@ -130,12 +132,15 @@ Set these variables in your deployment environment (e.g., Cloud Run or Docker):
 | `DATASET_ID` | Target BigQuery Dataset | `SCReport` |
 | `AUTH_TABLE` | Authorization table | `AuthenByMenu` |
 | `LOG_TABLE` | Action logger table | `AiLog` |
+| `REPORT_BUCKET` | Google Cloud Storage Bucket for reports | `sc-report-files` |
+| `GCS_REPORT_PREFIX` | Folder prefix inside the GCS bucket | `reports/` |
+| `GCS_SIGNED_URL_TTL` | Expiration time for signed URLs (seconds) | `86400` (24 Hours) |
 | `PUBLIC_BASE_URL` | Public endpoint domain | `https://sc-report-866803019306.asia-southeast3.run.app` |
 | `COST_USD_TO_THB` | USD to THB rate | `32.57` |
 | `COST_BQ_PRICE_PER_TB` | BQ billing price per TB (USD) | `6.25` |
 | `COST_CLOUD_RUN_VCPU` | Allocated vCPU | `1.0` |
 | `COST_CLOUD_RUN_MEM_GIB` | Allocated Memory (GB) | `0.5` |
-| `CLEANUP_STRATEGY` | Disk cleanup strategy (`age`, `keep_latest`, `aggressive`) | `age` |
+| `CLEANUP_STRATEGY` | GCS cleanup strategy (`age`, `keep_latest`, `aggressive`) | `age` |
 | `CLEANUP_AGE_SECONDS` | Maximum file age before removal (seconds) | `86400` (24 Hours) |
 | `CLEANUP_MAX_FILES` | Max files to keep if using `keep_latest` | `20` |
 | `CLEANUP_SECRET` | Header secret token for manual cleanup trigger and file manager deletion | `super-secret-sc-cleanup-2025` |
@@ -170,3 +175,4 @@ FROM `sc-ai-uat.SCReport.AiLog`
 ORDER BY CreatedAt DESC
 LIMIT 50;
 ```
+

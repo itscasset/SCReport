@@ -12,19 +12,11 @@ import secrets
 import hmac
 import hashlib
 import base64
-import base64
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
 from email.encoders import encode_base64
-from typing import Optional
-from pathlib import Path
-# from googleapiclient.discovery import build
-# from google.auth import default as google_auth_default
-# from google.auth.transport.requests import Request as GoogleAuthRequest
-# import google.auth.credentials
-
 from dataclasses import dataclass
 from typing import Literal, Optional
 from pathlib import Path
@@ -74,12 +66,14 @@ UNRESOLVED_TEMPLATE_REGEX = re.compile(
     re.IGNORECASE
 )
 
+
 @dataclass
 class BigQueryCost:
     bytes_billed: int
     tb_billed: float
     cost_usd: float
     cost_thb: float
+
 
 @dataclass
 class CloudRunCost:
@@ -92,6 +86,7 @@ class CloudRunCost:
     total_cost_usd: float
     total_cost_thb: float
 
+
 @dataclass
 class TotalCost:
     bigquery: BigQueryCost
@@ -101,12 +96,14 @@ class TotalCost:
     usd_to_thb_rate: float
     summary: str
 
+
 def calculate_bigquery_cost(bytes_billed, price_per_tb_usd=BQ_PRICE_PER_TB_USD, usd_to_thb=32.57):
     safe_bytes = max(int(bytes_billed), 0)
     tb_billed = safe_bytes / (1024 ** 4)
     cost_usd = tb_billed * price_per_tb_usd
     cost_thb = cost_usd * usd_to_thb
     return BigQueryCost(safe_bytes, round(tb_billed, 10), round(cost_usd, 8), round(cost_thb, 6))
+
 
 def calculate_cloud_run_cost(duration_seconds, vcpu=1.0, memory_gib=0.5, 
                               request_price_per_million=CLOUD_RUN_REQUEST_PRICE_PER_M,
@@ -125,6 +122,7 @@ def calculate_cloud_run_cost(duration_seconds, vcpu=1.0, memory_gib=0.5,
         round(total_usd, 8), round(total_thb, 6),
     )
 
+
 def calculate_total_cost(bytes_billed, duration_seconds, vcpu=1.0, memory_gib=0.5,
                           usd_to_thb=32.57, bq_price_per_tb_usd=BQ_PRICE_PER_TB_USD):
     bq = calculate_bigquery_cost(bytes_billed, bq_price_per_tb_usd, usd_to_thb)
@@ -137,6 +135,7 @@ def calculate_total_cost(bytes_billed, duration_seconds, vcpu=1.0, memory_gib=0.
         f"Total: ${grand_usd:.6f} / ฿{grand_thb:.4f}"
     )
     return TotalCost(bq, cr, round(grand_usd, 8), round(grand_thb, 6), usd_to_thb, summary)
+
 
 def format_cost_breakdown(cost):
     return {
@@ -162,6 +161,7 @@ def format_cost_breakdown(cost):
         "summary": cost.summary,
     }
 
+
 # ============================================================
 # SECTION 2 — CONFIGURATION
 # ============================================================
@@ -185,10 +185,11 @@ COST_BQ_PRICE_PER_TB = float(os.environ.get("COST_BQ_PRICE_PER_TB", "6.25"))
 CLEANUP_SECRET = os.environ.get("CLEANUP_SECRET")
 LIBRECHAT_JWT_SECRET = os.environ.get("LIBRECHAT_JWT_SECRET", "")
 
-# ── GMAIL API CONFIGURATION ──────────────────────────────────
-SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "didcon65@gmail.com")
-# Service Account จะถูกดึงอัตโนมัติจาก Cloud Run metadata
-# ไม่ต้องใช้ password ใดๆ
+# ── SMTP CONFIGURATIONS ──────────────────────────────────────
+SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.office365.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "bot-report@scasset.com")
+SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD", "your-app-password")
 
 SESSION_COOKIE_NAME = "sc_report_session"
 SESSION_MAX_AGE = 3600
@@ -227,24 +228,10 @@ CURRENT_REQUEST_BASE_URL: ContextVar[Optional[str]] = ContextVar(
     "current_request_base_url", default=None
 )
 
+
 # ============================================================
 # SECTION 4 — VALIDATORS & HELPERS (FIX #14: better regex)
 # ============================================================
-# LibreChat masks emails as [EMAIL_MASKED_actual@email.com] before passing to MCP tools
-LIBRECHAT_MASKED_EMAIL_REGEX = re.compile(
-    r'^\[EMAIL_MASKED_([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})\]$',
-    re.IGNORECASE
-)
-
-def unmask_librechat_email(value: str) -> str:
-    """ถ้า LibreChat mask email เป็น [EMAIL_MASKED_xxx@yyy.com] ให้ดึง email จริงออกมา"""
-    if not value:
-        return value
-    m = LIBRECHAT_MASKED_EMAIL_REGEX.match(value.strip())
-    if m:
-        return m.group(1)
-    return value
-
 def is_valid_email(value: object) -> bool:
     """✅ FIX #14: RFC-compliant + length check + template rejection"""
     if not value or not isinstance(value, str):
@@ -256,47 +243,47 @@ def is_valid_email(value: object) -> bool:
         return False
     return bool(EMAIL_REGEX.match(val_strip))
 
-def send_report_email(file_path: Optional[Path], file_name: Optional[str], to_email: str, subject: str, body: str) -> bool:
-    """ฟังก์ชันส่งอีเมลด้วย SMTP + App Password แทนการใช้ Gmail API"""
+
+def send_report_email(file_path: Path, file_name: str, to_email: str, subject: str, body: str) -> bool:
     if not is_valid_email(to_email):
         logger.warning(f"[Email] Invalid recipient email: '{to_email}'")
         return False
+
+    if not SENDER_PASSWORD or SENDER_PASSWORD == "your-app-password":
+        logger.warning("[Email] SENDER_PASSWORD is not configured or is using default placeholder. Skipping email dispatch.")
+        return False
+
     try:
-        # สร้าง MIME message
         msg = MIMEMultipart()
         msg['From'] = SENDER_EMAIL
         msg['To'] = to_email
         msg['Subject'] = subject
-        msg.attach(MIMEText(body, 'plain', 'utf-8'))
 
-        # แนบไฟล์ (ตรวจสอบก่อนว่ามีไฟล์ให้แนบหรือไม่)
-        if file_path and file_path.exists() and file_name:
-            with open(file_path, "rb") as attachment:
-                part = MIMEBase("application", "octet-stream")
-                part.set_payload(attachment.read())
-                encode_base64(part)
-                part.add_header("Content-Disposition", f"attachment; filename={file_name}")
-                msg.attach(part)
+        msg.attach(MIMEText(body, 'plain'))
 
-        # 🔑 ใส่รหัส App Password 16 หลักของคุณตรงนี้ (พิมพ์ติดกันหมด ห้ามเว้นวรรค)
-        smtp_password = os.getenv("SMTP_PASSWORD", "unzrapiuewjlwrwx")
+        with open(file_path, "rb") as attachment:
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(attachment.read())
+            encode_base64(part)
+            part.add_header("Content-Disposition", f"attachment; filename={file_name}")
+            msg.attach(part)
 
-        # ส่งผ่าน Server SMTP ของ Gmail ตรงๆ
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(SENDER_EMAIL, smtp_password)
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SENDER_EMAIL, SENDER_PASSWORD)
             server.send_message(msg)
-
-        logger.info(f"[Email] Successfully sent email to '{mask_username(to_email)}' via SMTP")
+        logger.info(f"[Email] Successfully sent '{file_name}' to '{mask_username(to_email)}'")
         return True
-
     except Exception as e:
         logger.error(f"[Email] Failed to send email to '{mask_username(to_email)}': {e}", exc_info=True)
         return False
+
 
 def sanitize_column_name(column: str) -> str:
     if not column or not SAFE_COLUMN_REGEX.match(column):
         raise PermissionError(f"คอลัมน์ '{column}' มีรูปแบบไม่ถูกต้องหรือไม่ปลอดภัย")
     return column
+
 
 def mask_username(username):
     if not username:
@@ -316,10 +303,12 @@ def mask_username(username):
         return username[0] + "***"
     return username[0] + "***" + username[-1]
 
+
 def clean_table_id(raw):
     if not raw:
         return ""
     return raw.strip().strip("`").strip()
+
 
 def validate_table_id(table_id):
     if not table_id:
@@ -327,17 +316,21 @@ def validate_table_id(table_id):
     full_bq_regex = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_]+\.[A-Za-z0-9_]+$")
     return bool(BQ_TABLE_REGEX.match(table_id)) or bool(full_bq_regex.match(table_id))
 
+
 def extract_short_table_name(table_id):
     clean = table_id.strip().strip("`").strip()
     return clean.split(".")[-1].lower()
+
 
 def is_valid_user(user):
     if not user:
         return False
     return bool(USER_REGEX.match(user.strip()))
 
+
 def is_sensitive_column(column):
     return bool(column and column.lower() in SENSITIVE_COLUMNS)
+
 
 # ============================================================
 # SECTION 5 — CACHES (FIX #6: schema cache)
@@ -383,6 +376,7 @@ def get_table_column_mapping(table_id):
         logger.error(f"Error fetching column mapping from Firestore: {e}", exc_info=True)
         return {}
 
+
 def get_table_schema(table_ref):
     """✅ FIX #6: cache BQ schema (TTL 1h)"""
     now = datetime.now(timezone.utc)
@@ -402,11 +396,13 @@ def get_table_schema(table_ref):
         logger.error(f"[Schema] Failed to fetch schema for {table_ref}: {e}")
         return {}
 
+
 # ============================================================
 # SECTION 6 — LOG ID GENERATOR
 # ============================================================
 def generate_ai_log_id():
     return uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+
 
 # ============================================================
 # SECTION 7 — JWT & USERNAME LOOKUP (FIX #1: async/sync split)
@@ -436,9 +432,11 @@ def extract_email_from_jwt(token):
         logger.warning(f"[JWT] Failed to decode token: {type(e).__name__}: {e}")
         return None
 
+
 def _lookup_username_sync(email):
     """
     ✅ FIX #1 + FIX #4: core sync implementation
+    
     ใช้จาก lookup_username_async() (ผ่าน to_thread) 
     หรือ tool handler (def, sync)
     """
@@ -483,14 +481,17 @@ def _lookup_username_sync(email):
         logger.error(f"[lookup_username] BQ error: {e}", exc_info=True)
         return None
 
+
 async def lookup_username_async(email):
     """✅ FIX #1: async wrapper"""
     return await asyncio.to_thread(_lookup_username_sync, email)
+
 
 # Backward-compat
 def lookup_username_from_email(email):
     """Sync version — ใช้ใน sync context"""
     return _lookup_username_sync(email)
+
 
 # ============================================================
 # SECTION 8 — SESSION TOKEN (FIX #2: ไม่ leak secret)
@@ -504,6 +505,7 @@ def _make_session_token():
     signature = hmac.HMAC(CLEANUP_SECRET.encode(), payload.encode(), hashlib.sha256).digest()
     sig_b64 = base64.urlsafe_b64encode(signature).decode().rstrip("=")
     return f"{payload}:{sig_b64}"
+
 
 def _verify_session_token(token):
     if not CLEANUP_SECRET or not token:
@@ -522,6 +524,7 @@ def _verify_session_token(token):
     except Exception:
         return False
 
+
 def _is_authenticated_for_files(x_cleanup_token, token_query, session_cookie):
     """✅ FIX #2: 3 sources auth; bypass ถ้าไม่ตั้ง secret (เดิม); ✅ FIX: timing-safe compare"""
     if not CLEANUP_SECRET:
@@ -535,11 +538,13 @@ def _is_authenticated_for_files(x_cleanup_token, token_query, session_cookie):
         return True
     return False
 
+
 # ============================================================
 # SECTION 9 — MCP SERVER & FASTAPI APP
 # ============================================================
 mcp = FastMCP("sc-report-server", stateless_http=True, json_response=True, host="0.0.0.0")
 mcp_asgi_app = mcp.streamable_http_app()
+
 
 @asynccontextmanager
 async def lifespan(app):
@@ -549,6 +554,7 @@ async def lifespan(app):
             yield
     finally:
         logger.info("App shutting down")
+
 
 app = FastAPI(
     title="SC Report MCP API & Server",
@@ -566,6 +572,7 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type", "current-user", "x-user-email"],
     max_age=3600,
 )
+
 
 # ============================================================
 # SECTION 10 — MIDDLEWARE (FIX #9: BaseHTTPMiddleware + ตัด log PII)
@@ -627,10 +634,10 @@ class CaptureUsernameMiddleware(BaseHTTPMiddleware):
             CURRENT_REQUEST_BQ_USERNAME.reset(token_bq_username)
             CURRENT_REQUEST_BASE_URL.reset(token_base)
 
+
 class BlockSSEMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
-        # if request.method == "GET" and request.url.path.rstrip("/") == "/ /sse":
-        if request.method == "GET" and request.url.path.rstrip("/") in ("/mcp", "/mcp/sse"):
+        if request.method == "GET" and request.url.path.rstrip("/") == "/mcp/sse":
             return JSONResponse(
                 status_code=405,
                 content={"detail": "SSE transport is disabled. Use POST /mcp for Streamable HTTP."},
@@ -638,18 +645,22 @@ class BlockSSEMiddleware(BaseHTTPMiddleware):
             )
         return await call_next(request)
 
+
 app.add_middleware(CaptureUsernameMiddleware)
 app.add_middleware(BlockSSEMiddleware)
+
 
 # ============================================================
 # SECTION 11 — PYDANTIC MODELS
 # ============================================================
 AllowedOperators = Literal["=", ">", "<", ">=", "<=", "LIKE", "!="]
 
+
 class FilterCondition(BaseModel):
     column: str = Field(..., min_length=1, description="ชื่อคอลัมน์ที่จะฟิลเตอร์")
     operator: AllowedOperators = Field(default="=", description="เครื่องหมายเปรียบเทียบ")
     value: str = Field(..., description="ค่าที่ใช้ค้นหา")
+
 
 class GenerateReportRequest(BaseModel):
     # ✅ FIX #16: เก็บ username/user_email fields ไว้เหมือนเดิม (backward-compat)
@@ -666,12 +677,14 @@ class GenerateReportRequest(BaseModel):
     send_email: Optional[bool] = False
     email_to: Optional[str] = None
 
+
 class CostEstimateRequest(BaseModel):
     bytes_billed: int = Field(..., ge=0)
     duration_seconds: float = Field(..., gt=0)
     vcpu: float = Field(default=1.0, gt=0)
     memory_gib: float = Field(default=0.5, gt=0)
     usd_to_thb: float = Field(default=32.57, gt=0)
+
 
 class GenerateChartRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -687,6 +700,7 @@ class GenerateChartRequest(BaseModel):
     filter_value: Optional[str] = None
     send_email: Optional[bool] = False
     email_to: Optional[str] = None
+
 
 # ============================================================
 # SECTION 12 — AUTH & RESOLUTION (FIX #1)
@@ -710,10 +724,12 @@ def _resolve_username_sync(fallback_email=None):
     )
     return ""
 
+
 # Backward-compat
 def resolve_username(fallback_email=None):
     """Sync entry — ตาม signature เดิม"""
     return _resolve_username_sync(fallback_email)
+
 
 def check_user_permission(username, table_id):
     if not is_valid_user(username):
@@ -757,12 +773,14 @@ def check_user_permission(username, table_id):
         logger.error(f"Auth verification database error: {e}")
         return None
 
+
 def validate_filter_column(table_id, column):
     if not table_id or not column:
         return False
     mapping_dict = get_table_column_mapping(table_id)
     target_column = column.lower()
     return any(k.lower() == target_column for k in mapping_dict.keys())
+
 
 # ============================================================
 # SECTION 13 — AI LOG (FIX #15: ใช้ BANGKOK_TZ)
@@ -801,6 +819,7 @@ def insert_ai_log(
     except Exception as e:
         logger.error(f"Exception in insert_ai_log: {e}", exc_info=True)
 
+
 # ============================================================
 # SECTION 14 — PARAM MAPPER (FIX #5: INT64 range + finite float)
 # ============================================================
@@ -832,6 +851,7 @@ def map_param_type_and_value(column_name, str_val, schema_dict):
 
     return "STRING", str_val
 
+
 # ============================================================
 # SECTION 15 — QUERY BUILDER (FIX #8: shared + ใช้ schema cache)
 # ============================================================
@@ -845,6 +865,7 @@ def _validate_columns(short_name, columns):
         if not validate_filter_column(short_name, col):
             raise PermissionError(f"คอลัมน์ '{col}' ไม่ได้รับอนุญาต")
         sanitize_column_name(col)
+
 
 def _build_query_and_params(table_id, limit, filter_column, filter_value,
                              filters, columns, condition):
@@ -906,6 +927,7 @@ def _build_query_and_params(table_id, limit, filter_column, filter_value,
 
     return query, params, bq_table_name, schema_dict
 
+
 # ============================================================
 # SECTION 16 — FETCH & GENERATE EXCEL
 # ============================================================
@@ -918,6 +940,7 @@ def fetch_and_generate_excel(
         table_id, limit, filter_column, filter_value, filters, columns, condition
     )
     actual_sql_executed = query
+
     job_config = bigquery.QueryJobConfig(query_parameters=params)
     job = bq_client.query(query, job_config=job_config)
     result = job.result()
@@ -964,6 +987,7 @@ def fetch_and_generate_excel(
     file_size_mb = round(file_path.stat().st_size / (1024 * 1024), 4)
     return row_count, file_name, bytes_billed, file_size_mb, actual_sql_executed, ai_log_id
 
+
 # ============================================================
 # SECTION 17 — CLEANUP
 # ============================================================
@@ -1004,6 +1028,7 @@ def cleanup_old_reports():
                 deleted += 1
 
     logger.info(f"Cleanup completed — {deleted} file(s) removed.")
+
 
 # ============================================================
 # SECTION 18 — REPORT GENERATION (orchestrator)
@@ -1079,51 +1104,51 @@ def _execute_report_generation(
         email_sent = False
         email_note = ""
         if send_email:
-            # Priority: explicit email_to (user พิมพ์มา) → middleware email (session)
+            # Priority: explicit email_to → user email from middleware
             recipient = None
-            middleware_email = CURRENT_REQUEST_USERNAME.get() or ""
-            # Unmask LibreChat email masking [EMAIL_MASKED_xxx@yyy.com] → xxx@yyy.com
-            email_to_clean = unmask_librechat_email(email_to) if email_to else None
-            logger.info(f"[Email-DEBUG] email_to raw='{email_to}' clean='{mask_username(email_to_clean or '')}' | is_valid={is_valid_email(email_to_clean or '')} | middleware='{mask_username(middleware_email)}'")
-            if email_to_clean and is_valid_email(email_to_clean):
-                recipient = email_to_clean
-                logger.info(f"[Email] Using explicit email_to as recipient: {mask_username(recipient)}")
-            elif is_valid_email(middleware_email):
-                recipient = middleware_email
-                logger.info(f"[Email] Using middleware email as recipient: {mask_username(recipient)}")
+            if email_to and is_valid_email(email_to):
+                recipient = email_to
+            else:
+                middleware_email = CURRENT_REQUEST_USERNAME.get() or ""
+                if is_valid_email(middleware_email):
+                    recipient = middleware_email
 
             if recipient:
                 file_path = REPORT_DIR / file_name
                 subject = f"[SC Report] {report_name} — {datetime.now(BANGKOK_TZ).strftime('%d/%m/%Y %H:%M')}"
-                # ถ้าไฟล์ใหญ่เกิน 20MB → ส่ง link แทน พร้อมเตือนให้โหลดเร็ว
-                EMAIL_ATTACH_LIMIT_MB = 20
-                file_size_for_email = file_path.stat().st_size / (1024 * 1024) if file_path.exists() else 0
-                if file_path.exists() and file_size_for_email < EMAIL_ATTACH_LIMIT_MB:
-                    body = (
+                body = (
+                    f"เรียนคุณ {username_to_use},\n\n"
+                    f"รายงาน '{report_name}' ({row_count:,} แถว) พร้อมแล้วครับ\n"
+                    f"ไฟล์แนบมาพร้อมกับอีเมลฉบับนี้ และสามารถดาวน์โหลดได้จากลิงก์ด้านล่าง:\n"
+                    f"{download_url}\n\n"
+                    f"ขอบคุณครับ\nSC Report Bot"
+                )
+                if file_path.exists():
+                    email_sent = send_report_email(file_path, file_name, recipient, subject, body)
+                    email_note = f" | ส่งอีเมลไปยัง {mask_username(recipient)}: {'สำเร็จ ✅' if email_sent else 'ไม่สำเร็จ ❌'}"
+                else:
+                    # file was already cleaned up; use download link only
+                    logger.warning("[Email] Local file not found after generation, sending link-only email")
+                    body_link_only = (
                         f"เรียนคุณ {username_to_use},\n\n"
                         f"รายงาน '{report_name}' ({row_count:,} แถว) พร้อมแล้วครับ\n"
-                        f"กรุณาเปิดไฟล์ Excel ที่แนบมากับอีเมลฉบับนี้ได้เลยครับ\n\n"
-                        f"ขอบคุณครับ\nSC Report Bot"
-                    )
-                    email_sent = send_report_email(file_path, file_name, recipient, subject, body)
-                    email_note = f" | ส่งอีเมล (พร้อมไฟล์แนบ) ไปยัง {mask_username(recipient)}: {'สำเร็จ ✅' if email_sent else 'ไม่สำเร็จ ❌'}"
-                elif file_path.exists():
-                    # ไฟล์ใหญ่เกิน 20MB — ส่งแค่ link พร้อมคำเตือน
-                    logger.info(f"[Email] File too large for attachment ({file_size_for_email:.1f} MB) — sending link only")
-                    body = (
-                        f"เรียนคุณ {username_to_use},\n\n"
-                        f"รายงาน '{report_name}' ({row_count:,} แถว) พร้อมแล้วครับ\n\n"
-                        f"⚠️ ไฟล์มีขนาด {file_size_for_email:.1f} MB ใหญ่เกินกว่าจะแนบในอีเมลได้\n"
-                        f"กรุณาดาวน์โหลดจากลิงก์ด้านล่างโดยเร็ว เนื่องจากลิงก์จะหมดอายุเมื่อระบบไม่มีผู้ใช้งาน:\n\n"
+                        f"กรุณาดาวน์โหลดได้จากลิงก์ด้านล่าง:\n"
                         f"{download_url}\n\n"
                         f"ขอบคุณครับ\nSC Report Bot"
                     )
-                    email_sent = send_report_email(None, None, recipient, subject, body)
-                    email_note = f" | ส่งอีเมล (ลิงก์อย่างเดียว ไฟล์ใหญ่ {file_size_for_email:.1f} MB) ไปยัง {mask_username(recipient)}: {'สำเร็จ ✅' if email_sent else 'ไม่สำเร็จ ❌'}"
-                else:
-                    logger.error("[Email] Local file not found after generation — cannot send")
-                    email_sent = False
-                    email_note = f" | ส่งอีเมลไปยัง {mask_username(recipient)}: ไม่สำเร็จ ❌ (ไฟล์หายก่อนส่ง)"
+                    try:
+                        msg_lo = MIMEText(body_link_only, 'plain')
+                        msg_lo['From'] = SENDER_EMAIL
+                        msg_lo['To'] = recipient
+                        msg_lo['Subject'] = subject
+                        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as srv:
+                            srv.starttls()
+                            srv.login(SENDER_EMAIL, SENDER_PASSWORD)
+                            srv.send_message(msg_lo)
+                        email_sent = True
+                    except Exception as mail_err:
+                        logger.error(f"[Email] Link-only fallback failed: {mail_err}")
+                    email_note = f" | ส่งลิงก์ดาวน์โหลดทางอีเมลไปยัง {mask_username(recipient)}: {'สำเร็จ ✅' if email_sent else 'ไม่สำเร็จ ❌'}"
             else:
                 email_note = " | ไม่สามารถส่งอีเมล: ไม่พบอีเมลปลายทางที่ถูกต้อง"
         # ─────────────────────────────────────────────────────────
@@ -1147,6 +1172,7 @@ def _execute_report_generation(
         insert_ai_log(username_to_use, bq_table_name, report_name or "", "FAIL")
         return {"success": False, "message": "พบปัญหาการสร้าง Excel"}
 
+
 def fetch_dataframe_for_chart(
     table_id, limit=2000, filter_column=None, filter_value=None,
     filters=None, columns=None, condition="AND",
@@ -1160,6 +1186,7 @@ def fetch_dataframe_for_chart(
     df = job.to_dataframe()
     bytes_billed = job.total_bytes_billed
     return df, bytes_billed, actual_sql_executed
+
 
 def _execute_chart_generation(
     table_id, code, limit=2000, filter_column=None, filter_value=None,
@@ -1268,47 +1295,24 @@ def _execute_chart_generation(
         email_sent = False
         email_note = ""
         if send_email:
-            # Priority: explicit email_to (user พิมพ์มา) → middleware email (session)
             recipient = None
-            middleware_email = CURRENT_REQUEST_USERNAME.get() or ""
-            # Unmask LibreChat email masking [EMAIL_MASKED_xxx@yyy.com] → xxx@yyy.com
-            email_to_clean = unmask_librechat_email(email_to) if email_to else None
-            if email_to_clean and is_valid_email(email_to_clean):
-                recipient = email_to_clean
-                logger.info(f"[Email] Using explicit email_to as recipient: {mask_username(recipient)}")
-            elif is_valid_email(middleware_email):
-                recipient = middleware_email
-                logger.info(f"[Email] Using middleware email as recipient: {mask_username(recipient)}")
+            if email_to and is_valid_email(email_to):
+                recipient = email_to
+            else:
+                middleware_email = CURRENT_REQUEST_USERNAME.get() or ""
+                if is_valid_email(middleware_email):
+                    recipient = middleware_email
 
             if recipient:
                 subject = f"[SC Report] แผนภูมิ {report_name} — {datetime.now(BANGKOK_TZ).strftime('%d/%m/%Y %H:%M')}"
-                EMAIL_ATTACH_LIMIT_MB = 20
-                file_size_for_email = file_path.stat().st_size / (1024 * 1024) if file_path.exists() else 0
-                if file_path.exists() and file_size_for_email < EMAIL_ATTACH_LIMIT_MB:
-                    body = (
-                        f"เรียนคุณ {username_to_use},\n\n"
-                        f"แผนภูมิของรายงาน '{report_name}' ({len(df):,} แถว) พร้อมแล้วครับ\n"
-                        f"กรุณาเปิดไฟล์รูปภาพที่แนบมากับอีเมลฉบับนี้ได้เลยครับ\n\n"
-                        f"ขอบคุณครับ\nSC Report Bot"
-                    )
-                    email_sent = send_report_email(file_path, file_name, recipient, subject, body)
-                    email_note = f" | ส่งอีเมล (พร้อมไฟล์แนบ) ไปยัง {mask_username(recipient)}: {'สำเร็จ ✅' if email_sent else 'ไม่สำเร็จ ❌'}"
-                elif file_path.exists():
-                    logger.info(f"[Email] Chart file too large for attachment ({file_size_for_email:.1f} MB) — sending link only")
-                    body = (
-                        f"เรียนคุณ {username_to_use},\n\n"
-                        f"แผนภูมิของรายงาน '{report_name}' ({len(df):,} แถว) พร้อมแล้วครับ\n\n"
-                        f"⚠️ ไฟล์มีขนาด {file_size_for_email:.1f} MB ใหญ่เกินกว่าจะแนบในอีเมลได้\n"
-                        f"กรุณาดาวน์โหลดจากลิงก์ด้านล่างโดยเร็ว เนื่องจากลิงก์จะหมดอายุเมื่อระบบไม่มีผู้ใช้งาน:\n\n"
-                        f"{download_url}\n\n"
-                        f"ขอบคุณครับ\nSC Report Bot"
-                    )
-                    email_sent = send_report_email(None, None, recipient, subject, body)
-                    email_note = f" | ส่งอีเมล (ลิงก์อย่างเดียว ไฟล์ใหญ่ {file_size_for_email:.1f} MB) ไปยัง {mask_username(recipient)}: {'สำเร็จ ✅' if email_sent else 'ไม่สำเร็จ ❌'}"
-                else:
-                    logger.error("[Email] Chart file not found — cannot send")
-                    email_sent = False
-                    email_note = f" | ส่งอีเมลไปยัง {mask_username(recipient)}: ไม่สำเร็จ ❌ (ไฟล์หายก่อนส่ง)"
+                body = (
+                    f"เรียนคุณ {username_to_use},\n\n"
+                    f"แผนภูมิของรายงาน '{report_name}' ({len(df):,} แถว) พร้อมแล้วครับ\n"
+                    f"ไฟล์แนบมาพร้อมกับอีเมลฉบับนี้ และสามารถดาวน์โหลดได้จากลิงก์ด้านล่าง:\n"
+                    f"{download_url}\n\nขอบคุณครับ\nSC Report Bot"
+                )
+                email_sent = send_report_email(file_path, file_name, recipient, subject, body)
+                email_note = f" | ส่งอีเมลไปยัง {mask_username(recipient)}: {'สำเร็จ ✅' if email_sent else 'ไม่สำเร็จ ❌'}"
             else:
                 email_note = " | ไม่สามารถส่งอีเมล: ไม่พบอีเมลปลายทางที่ถูกต้อง"
         # ─────────────────────────────────────────────────────────
@@ -1329,6 +1333,8 @@ def _execute_chart_generation(
         logger.error(f"Chart Execution Error: {e}", exc_info=True)
         insert_ai_log(username_to_use, bq_table_name, report_name or "", "FAIL_CHART")
         return {"success": False, "message": f"พบปัญหาการดึงข้อมูลเพื่อวาดกราฟ: {str(e)}"}
+
+
 
 # ============================================================
 # SECTION 19 — MCP TOOLS (เก็บ signature เดิมที่ทำงานได้ทั้งหมด)
@@ -1360,13 +1366,13 @@ def mcp_sc_report_export(
         res["cost_summary"] = res["cost"].get("summary", "")
     return res
 
+
 @mcp.tool(
     name="generate_excel_report",
     description=(
         "สร้างไฟล์ Excel จากรายงานใน BigQuery\n\n"
         "📧 ส่งอีเมล: ตั้ง send_email=true เพื่อส่งไฟล์ไปยังอีเมลของผู้ใช้โดยอัตโนมัติ "
-        "(ระบบดึงอีเมลจาก login session อัตโนมัติ ไม่ต้องระบุ email_to — "
-        "ระบุ email_to เฉพาะเมื่อผู้ใช้ต้องการส่งไปยังอีเมลอื่นที่พิมพ์มาให้ครบเท่านั้น)"
+        "(ระบบดึงอีเมลจาก token อัตโนมัติ หรือระบุ email_to เพื่อกำหนดเอง)"
     )
 )
 def mcp_generate_excel_report(
@@ -1413,6 +1419,7 @@ def mcp_generate_excel_report(
             f"{res['download_url']}\n{cost_line}{email_line}"
         )
     return res["message"]
+
 
 @mcp.tool(
     name="generate_chart_report",
@@ -1486,7 +1493,10 @@ def mcp_generate_chart_report(
             f"{sample_str}\n\n"
             f"💡 กรุณาใช้ชื่อ column จาก available_columns เท่านั้น"
         )
+
     return res["message"]
+
+
 
 # ✅ คง signature เดิมเป๊ะ — ไม่มี parameter เลย
 @mcp.tool(
@@ -1542,11 +1552,13 @@ def mcp_check_accessible_reports() -> dict:
         logger.error(f"Error fetching accessible reports: {e}")
         return {"success": False, "message": f"เกิดข้อผิดพลาดในการดึงข้อมูลสิทธิ์: {str(e)}"}
 
+
 # ============================================================
 # SECTION 19B — MISSING MCP TOOLS (data-poc group)
 # list_available_tables / describe_table / ask_data
 # Required by mandatory workflow (System Prompt §3)
 # ============================================================
+
 @mcp.tool(
     name="list_available_tables",
     description=(
@@ -1578,6 +1590,7 @@ def mcp_list_available_tables(dataset: Optional[str] = None) -> dict:
     except Exception as e:
         logger.error(f"[list_available_tables] Error: {e}", exc_info=True)
         return {"success": False, "message": f"เกิดข้อผิดพลาดในการดึงรายชื่อตาราง: {str(e)}"}
+
 
 @mcp.tool(
     name="describe_table",
@@ -1644,6 +1657,7 @@ def mcp_describe_table(dataset: str, table: str) -> dict:
     except Exception as e:
         logger.error(f"[describe_table] Error for {table_ref}: {e}", exc_info=True)
         return {"success": False, "message": f"เกิดข้อผิดพลาดในการดึง schema ของตาราง '{table}': {str(e)}"}
+
 
 @mcp.tool(
     name="ask_data",
@@ -1812,10 +1826,10 @@ def mcp_ask_data(dataGroup: str, question: str) -> dict:
         logger.error(f"[ask_data] Error: {e}", exc_info=True)
         return {"success": False, "message": f"เกิดข้อผิดพลาดในการวิเคราะห์ข้อมูล: {str(e)}"}
 
+
 # ============================================================
 # SECTION 20 — REST API ENDPOINTS
 # ============================================================
-
 @app.post("/generate_excel_report")
 def generate_excel_report(request: GenerateReportRequest):
     res = _execute_report_generation(
@@ -1835,6 +1849,7 @@ def generate_excel_report(request: GenerateReportRequest):
             "email_sent": res.get("email_sent"),
         }
     return {"success": False, "message": res["message"]}
+
 
 @app.post("/generate_chart_report")
 def generate_chart_report(request: GenerateChartRequest):
@@ -1857,6 +1872,7 @@ def generate_chart_report(request: GenerateChartRequest):
         }
     return {"success": False, "message": res["message"]}
 
+
 @app.post("/cost_estimate")
 def cost_estimate(req: CostEstimateRequest):
     cost = calculate_total_cost(
@@ -1865,6 +1881,7 @@ def cost_estimate(req: CostEstimateRequest):
         bq_price_per_tb_usd=COST_BQ_PRICE_PER_TB,
     )
     return format_cost_breakdown(cost)
+
 
 @app.get("/download/{file_name}")
 def download_report(file_name: str, direct: bool = False):
@@ -1889,9 +1906,11 @@ def download_report(file_name: str, direct: bool = False):
     )
     return HTMLResponse(content=html_content)
 
+
 @app.get("/health")
 def health_check():
     return {"status": "healthy"}
+
 
 # ============================================================
 # SECTION 21 — FILE MANAGER (FIX #2: session-based auth)
@@ -1922,11 +1941,13 @@ async def files_login(
     )
     return response
 
+
 @app.post("/files/logout")
 async def files_logout():
     response = JSONResponse({"success": True, "message": "Logged out"})
     response.delete_cookie(SESSION_COOKIE_NAME)
     return response
+
 
 def _render_login_page():
     """✅ FIX #2: หน้า login แยก — ไม่มี secret ใน HTML"""
@@ -1970,6 +1991,7 @@ document.getElementById('tokenInput').addEventListener('keypress', (e) => {
   if (e.key === 'Enter') doLogin();
 });
 </script></body></html>"""
+
 
 @app.get("/files")
 @app.get("/file")
@@ -2250,6 +2272,7 @@ def list_files(
         logger.error(f"Error listing files: {e}", exc_info=True)
         return {"success": False, "message": f"Failed to list files: {str(e)}"}
 
+
 @app.delete("/files/{file_name}")
 async def delete_file(
     file_name: str,
@@ -2278,6 +2301,7 @@ async def delete_file(
         logger.error(f"Failed to delete {file_name}: {e}")
         raise HTTPException(status_code=500, detail=f"ลบไฟล์ไม่สำเร็จ: {str(e)}")
 
+
 @app.post("/internal/cleanup")
 async def trigger_cleanup(
     x_cleanup_token: Optional[str] = Header(None),
@@ -2291,10 +2315,12 @@ async def trigger_cleanup(
     await asyncio.to_thread(cleanup_old_reports)
     return {"success": True, "message": "Cleanup completed successfully"}
 
+
 # ============================================================
 # SECTION 22 — MOUNT MCP & ENTRYPOINT
 # ============================================================
 app.mount("", mcp_asgi_app)
+
 
 if __name__ == "__main__":
     import uvicorn

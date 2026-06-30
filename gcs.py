@@ -1,6 +1,6 @@
 # ============================================================
 # SECTION 0 — IMPORTS
-# =========================================================
+# ============================================================
 import os
 import re
 import uuid
@@ -12,19 +12,6 @@ import secrets
 import hmac
 import hashlib
 import base64
-import base64
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
-from email.mime.text import MIMEText
-from email.encoders import encode_base64
-from typing import Optional
-from pathlib import Path
-# from googleapiclient.discovery import build
-# from google.auth import default as google_auth_default
-# from google.auth.transport.requests import Request as GoogleAuthRequest
-# import google.auth.credentials
-
 from dataclasses import dataclass
 from typing import Literal, Optional
 from pathlib import Path
@@ -33,16 +20,19 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
+from io import BytesIO
+import html
+import json
+from urllib.parse import quote
 
-import jwt as pyjwt  # PyJWT — must be listed in requirements.txt
 import pandas as pd
 from pydantic import BaseModel, Field, ConfigDict
 from openpyxl import Workbook
 from fastapi import FastAPI, Request, Header, HTTPException, Cookie
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from starlette.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
-from google.cloud import bigquery, firestore
+from google.cloud import bigquery, firestore, storage
 from mcp.server.fastmcp import FastMCP
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -57,7 +47,7 @@ from mapping import (
 )
 
 # ============================================================
-# SECTION 1 — COST CALCULATOR (เหมือนเดิม)
+# SECTION 1 — COST CALCULATOR
 # ============================================================
 BQ_PRICE_PER_TB_USD: float = 6.25
 CLOUD_RUN_REQUEST_PRICE_PER_M: float = 0.40
@@ -74,12 +64,14 @@ UNRESOLVED_TEMPLATE_REGEX = re.compile(
     re.IGNORECASE
 )
 
+
 @dataclass
 class BigQueryCost:
     bytes_billed: int
     tb_billed: float
     cost_usd: float
     cost_thb: float
+
 
 @dataclass
 class CloudRunCost:
@@ -92,6 +84,7 @@ class CloudRunCost:
     total_cost_usd: float
     total_cost_thb: float
 
+
 @dataclass
 class TotalCost:
     bigquery: BigQueryCost
@@ -101,6 +94,7 @@ class TotalCost:
     usd_to_thb_rate: float
     summary: str
 
+
 def calculate_bigquery_cost(bytes_billed, price_per_tb_usd=BQ_PRICE_PER_TB_USD, usd_to_thb=32.57):
     safe_bytes = max(int(bytes_billed), 0)
     tb_billed = safe_bytes / (1024 ** 4)
@@ -108,7 +102,8 @@ def calculate_bigquery_cost(bytes_billed, price_per_tb_usd=BQ_PRICE_PER_TB_USD, 
     cost_thb = cost_usd * usd_to_thb
     return BigQueryCost(safe_bytes, round(tb_billed, 10), round(cost_usd, 8), round(cost_thb, 6))
 
-def calculate_cloud_run_cost(duration_seconds, vcpu=1.0, memory_gib=0.5, 
+
+def calculate_cloud_run_cost(duration_seconds, vcpu=1.0, memory_gib=0.5,
                               request_price_per_million=CLOUD_RUN_REQUEST_PRICE_PER_M,
                               cpu_price_per_vcpu_sec=CLOUD_RUN_CPU_PRICE_PER_VCPU_SEC,
                               mem_price_per_gib_sec=CLOUD_RUN_MEM_PRICE_PER_GIB_SEC,
@@ -125,6 +120,7 @@ def calculate_cloud_run_cost(duration_seconds, vcpu=1.0, memory_gib=0.5,
         round(total_usd, 8), round(total_thb, 6),
     )
 
+
 def calculate_total_cost(bytes_billed, duration_seconds, vcpu=1.0, memory_gib=0.5,
                           usd_to_thb=32.57, bq_price_per_tb_usd=BQ_PRICE_PER_TB_USD):
     bq = calculate_bigquery_cost(bytes_billed, bq_price_per_tb_usd, usd_to_thb)
@@ -137,6 +133,7 @@ def calculate_total_cost(bytes_billed, duration_seconds, vcpu=1.0, memory_gib=0.
         f"Total: ${grand_usd:.6f} / ฿{grand_thb:.4f}"
     )
     return TotalCost(bq, cr, round(grand_usd, 8), round(grand_thb, 6), usd_to_thb, summary)
+
 
 def format_cost_breakdown(cost):
     return {
@@ -162,6 +159,22 @@ def format_cost_breakdown(cost):
         "summary": cost.summary,
     }
 
+def _normalize_gcs_prefix(prefix: str) -> str:
+    cleaned = (prefix or "reports/").strip().strip("/")
+    return f"{cleaned}/" if cleaned else "reports/"
+
+
+def _safe_report_filename(file_name: str) -> str:
+    if not DOWNLOAD_FILENAME_REGEX.fullmatch(file_name or ""):
+        raise HTTPException(status_code=400, detail="รูปแบบชื่อไฟล์ไม่ถูกต้อง")
+    return file_name
+
+
+def _gcs_blob_name(file_name: str) -> str:
+    safe_name = _safe_report_filename(file_name)
+    return f"{_normalize_gcs_prefix(GCS_REPORT_PREFIX)}{safe_name}"
+
+
 # ============================================================
 # SECTION 2 — CONFIGURATION
 # ============================================================
@@ -181,14 +194,15 @@ COST_CLOUD_RUN_VCPU = float(os.environ.get("COST_CLOUD_RUN_VCPU", "1.0"))
 COST_CLOUD_RUN_MEM_GIB = float(os.environ.get("COST_CLOUD_RUN_MEM_GIB", "0.5"))
 COST_BQ_PRICE_PER_TB = float(os.environ.get("COST_BQ_PRICE_PER_TB", "6.25"))
 
-# ⚠️ ยังคง optional (ไม่แตะตามที่คุณขอ)
 CLEANUP_SECRET = os.environ.get("CLEANUP_SECRET")
 LIBRECHAT_JWT_SECRET = os.environ.get("LIBRECHAT_JWT_SECRET", "")
 
-# ── GMAIL API CONFIGURATION ──────────────────────────────────
-SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "didcon65@gmail.com")
-# Service Account จะถูกดึงอัตโนมัติจาก Cloud Run metadata
-# ไม่ต้องใช้ password ใดๆ
+# ── GCS ──────────────────────────────────────────────────────
+REPORT_BUCKET = os.environ.get("REPORT_BUCKET", "sc-report-files")
+GCS_REPORT_PREFIX = os.environ.get("GCS_REPORT_PREFIX", "reports/")
+# signed URL TTL (วินาที) — default 24 ชม.
+GCS_SIGNED_URL_TTL = int(os.environ.get("GCS_SIGNED_URL_TTL", str(24 * 3600)))
+# ─────────────────────────────────────────────────────────────
 
 SESSION_COOKIE_NAME = "sc_report_session"
 SESSION_MAX_AGE = 3600
@@ -198,17 +212,18 @@ SESSION_MAX_AGE = 3600
 # ============================================================
 bq_client = bigquery.Client(project=PROJECT_ID)
 firestore_client = firestore.Client(project=PROJECT_ID)
+gcs_client = storage.Client(project=PROJECT_ID)          # ← NEW
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("SCReportSecurity")
 
+# /tmp ยังคงใช้เป็น staging area ชั่วคราวก่อนอัปโหลด GCS
 REPORT_DIR = Path("/tmp/reports").resolve()
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 _MAPPING_CACHE: dict[str, tuple[dict[str, str], datetime]] = {}
-_MAPPING_CACHE_LOCK = Lock()  # ✅ FIX: เพิ่ม lock
+_MAPPING_CACHE_LOCK = Lock()
 CACHE_TTL = timedelta(minutes=5)
 
-# ✅ FIX: Schema cache (ลด BQ calls)
 _SCHEMA_CACHE: dict[str, tuple[dict[str, str], datetime]] = {}
 _SCHEMA_CACHE_LOCK = Lock()
 SCHEMA_CACHE_TTL = timedelta(hours=1)
@@ -227,26 +242,194 @@ CURRENT_REQUEST_BASE_URL: ContextVar[Optional[str]] = ContextVar(
     "current_request_base_url", default=None
 )
 
-# ============================================================
-# SECTION 4 — VALIDATORS & HELPERS (FIX #14: better regex)
-# ============================================================
-# LibreChat masks emails as [EMAIL_MASKED_actual@email.com] before passing to MCP tools
-LIBRECHAT_MASKED_EMAIL_REGEX = re.compile(
-    r'^\[EMAIL_MASKED_([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})\]$',
-    re.IGNORECASE
-)
 
-def unmask_librechat_email(value: str) -> str:
-    """ถ้า LibreChat mask email เป็น [EMAIL_MASKED_xxx@yyy.com] ให้ดึง email จริงออกมา"""
-    if not value:
-        return value
-    m = LIBRECHAT_MASKED_EMAIL_REGEX.match(value.strip())
-    if m:
-        return m.group(1)
-    return value
+# ============================================================
+# SECTION 4 — GCS HELPERS
+# ============================================================
+def _normalize_gcs_prefix(prefix: str) -> str:
+    cleaned = (prefix or "reports/").strip().strip("/")
+    return f"{cleaned}/" if cleaned else "reports/"
 
+
+def _safe_report_filename(file_name: str) -> str:
+    if not DOWNLOAD_FILENAME_REGEX.fullmatch(file_name or ""):
+        raise HTTPException(status_code=400, detail="รูปแบบชื่อไฟล์ไม่ถูกต้อง")
+    return file_name
+
+
+def _gcs_blob_name(file_name: str) -> str:
+    safe_name = _safe_report_filename(file_name)
+    return f"{_normalize_gcs_prefix(GCS_REPORT_PREFIX)}{safe_name}"
+
+
+def get_gcs_content_type(file_name: str) -> str:
+    safe_name = _safe_report_filename(file_name)
+    if safe_name.endswith(".png"):
+        return "image/png"
+    return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def get_gcs_blob(file_name: str):
+    safe_name = _safe_report_filename(file_name)
+    bucket = gcs_client.bucket(REPORT_BUCKET)
+    blob = bucket.blob(_gcs_blob_name(safe_name))
+
+    if not blob.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="ไฟล์หมดอายุหรือไม่พบในระบบ",
+        )
+
+    return blob
+
+
+def upload_to_gcs(local_path: Path, file_name: str) -> None:
+    safe_name = _safe_report_filename(file_name)
+
+    bucket = gcs_client.bucket(REPORT_BUCKET)
+    blob = bucket.blob(_gcs_blob_name(safe_name))
+
+    blob.upload_from_filename(
+        str(local_path),
+        content_type=get_gcs_content_type(safe_name),
+    )
+
+    logger.info(
+        "[GCS] Uploaded '%s' -> gs://%s/%s",
+        safe_name,
+        REPORT_BUCKET,
+        blob.name,
+    )
+
+    try:
+        local_path.unlink(missing_ok=True)
+    except Exception:
+        logger.warning(
+            "[GCS] Failed to remove local staging file: %s",
+            local_path,
+            exc_info=True,
+        )
+
+
+def generate_gcs_signed_url(file_name: str) -> str:
+    safe_name = _safe_report_filename(file_name)
+    blob = get_gcs_blob(safe_name)
+
+    return blob.generate_signed_url(
+        version="v4",
+        expiration=timedelta(seconds=GCS_SIGNED_URL_TTL),
+        method="GET",
+        response_disposition=f'attachment; filename="{safe_name}"',
+        response_type=get_gcs_content_type(safe_name),
+    )
+
+
+def download_from_gcs(file_name: str) -> tuple[bytes, str]:
+    """
+    Backward-compatible helper.
+    Prefer StreamingResponse in /download for large files.
+    """
+    safe_name = _safe_report_filename(file_name)
+    blob = get_gcs_blob(safe_name)
+    return blob.download_as_bytes(), get_gcs_content_type(safe_name)
+
+
+def list_gcs_files() -> list[dict]:
+    bucket = gcs_client.bucket(REPORT_BUCKET)
+    gcs_prefix = _normalize_gcs_prefix(GCS_REPORT_PREFIX)
+
+    files = []
+    for blob in bucket.list_blobs(prefix=gcs_prefix):
+        name = blob.name.removeprefix(gcs_prefix)
+
+        if not name:
+            continue
+
+        if not DOWNLOAD_FILENAME_REGEX.fullmatch(name):
+            logger.warning(
+                "[GCS] Ignoring unexpected object under report prefix: %s",
+                blob.name,
+            )
+            continue
+
+        files.append({
+            "name": name,
+            "size_bytes": blob.size or 0,
+            "size_mb": round((blob.size or 0) / (1024 * 1024), 4),
+            "created_at": blob.time_created.isoformat() if blob.time_created else "",
+            "modified_at": blob.updated.isoformat() if blob.updated else "",
+        })
+
+    return sorted(files, key=lambda x: x["modified_at"], reverse=True)
+
+
+def delete_gcs_file(file_name: str) -> None:
+    safe_name = _safe_report_filename(file_name)
+    blob = get_gcs_blob(safe_name)
+    blob.delete()
+
+    logger.info("[GCS] Deleted '%s'", safe_name)
+
+
+def cleanup_gcs_files() -> int:
+    cleanup_strategy = os.environ.get("CLEANUP_STRATEGY", "age").lower()
+    cleanup_age_seconds = int(os.environ.get("CLEANUP_AGE_SECONDS", "86400"))
+    cleanup_max_files = int(os.environ.get("CLEANUP_MAX_FILES", "20"))
+
+    files = list_gcs_files()
+    deleted = 0
+    now = datetime.now(timezone.utc)
+
+    def delete_file(name: str) -> None:
+        nonlocal deleted
+        get_gcs_blob(name).delete()
+        deleted += 1
+
+    if cleanup_strategy == "age":
+        cutoff = now - timedelta(seconds=cleanup_age_seconds)
+
+        for f in files:
+            raw_modified_at = f.get("modified_at") or ""
+
+            try:
+                modified_at = datetime.fromisoformat(raw_modified_at)
+            except ValueError:
+                logger.warning(
+                    "[GCS] Skipping cleanup for invalid modified_at: %s",
+                    f,
+                )
+                continue
+
+            if modified_at.tzinfo is None:
+                modified_at = modified_at.replace(tzinfo=timezone.utc)
+
+            if modified_at.astimezone(timezone.utc) < cutoff:
+                delete_file(f["name"])
+
+    elif cleanup_strategy == "keep_latest":
+        keep_count = max(cleanup_max_files, 0)
+
+        for f in files[keep_count:]:
+            delete_file(f["name"])
+
+    elif cleanup_strategy == "aggressive":
+        for f in files:
+            delete_file(f["name"])
+
+    else:
+        logger.warning(
+            "[GCS] Unknown CLEANUP_STRATEGY='%s'; no files deleted.",
+            cleanup_strategy,
+        )
+
+    logger.info("[GCS] Cleanup completed - %s file(s) removed.", deleted)
+    return deleted
+
+
+# ============================================================
+# SECTION 5 — VALIDATORS & HELPERS
+# ============================================================
 def is_valid_email(value: object) -> bool:
-    """✅ FIX #14: RFC-compliant + length check + template rejection"""
     if not value or not isinstance(value, str):
         return False
     val_strip = value.strip()
@@ -256,47 +439,12 @@ def is_valid_email(value: object) -> bool:
         return False
     return bool(EMAIL_REGEX.match(val_strip))
 
-def send_report_email(file_path: Optional[Path], file_name: Optional[str], to_email: str, subject: str, body: str) -> bool:
-    """ฟังก์ชันส่งอีเมลด้วย SMTP + App Password แทนการใช้ Gmail API"""
-    if not is_valid_email(to_email):
-        logger.warning(f"[Email] Invalid recipient email: '{to_email}'")
-        return False
-    try:
-        # สร้าง MIME message
-        msg = MIMEMultipart()
-        msg['From'] = SENDER_EMAIL
-        msg['To'] = to_email
-        msg['Subject'] = subject
-        msg.attach(MIMEText(body, 'plain', 'utf-8'))
-
-        # แนบไฟล์ (ตรวจสอบก่อนว่ามีไฟล์ให้แนบหรือไม่)
-        if file_path and file_path.exists() and file_name:
-            with open(file_path, "rb") as attachment:
-                part = MIMEBase("application", "octet-stream")
-                part.set_payload(attachment.read())
-                encode_base64(part)
-                part.add_header("Content-Disposition", f"attachment; filename={file_name}")
-                msg.attach(part)
-
-        # 🔑 ใส่รหัส App Password 16 หลักของคุณตรงนี้ (พิมพ์ติดกันหมด ห้ามเว้นวรรค)
-        smtp_password = os.getenv("SMTP_PASSWORD", "unzrapiuewjlwrwx")
-
-        # ส่งผ่าน Server SMTP ของ Gmail ตรงๆ
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(SENDER_EMAIL, smtp_password)
-            server.send_message(msg)
-
-        logger.info(f"[Email] Successfully sent email to '{mask_username(to_email)}' via SMTP")
-        return True
-
-    except Exception as e:
-        logger.error(f"[Email] Failed to send email to '{mask_username(to_email)}': {e}", exc_info=True)
-        return False
 
 def sanitize_column_name(column: str) -> str:
     if not column or not SAFE_COLUMN_REGEX.match(column):
         raise PermissionError(f"คอลัมน์ '{column}' มีรูปแบบไม่ถูกต้องหรือไม่ปลอดภัย")
     return column
+
 
 def mask_username(username):
     if not username:
@@ -316,10 +464,12 @@ def mask_username(username):
         return username[0] + "***"
     return username[0] + "***" + username[-1]
 
+
 def clean_table_id(raw):
     if not raw:
         return ""
     return raw.strip().strip("`").strip()
+
 
 def validate_table_id(table_id):
     if not table_id:
@@ -327,27 +477,31 @@ def validate_table_id(table_id):
     full_bq_regex = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_]+\.[A-Za-z0-9_]+$")
     return bool(BQ_TABLE_REGEX.match(table_id)) or bool(full_bq_regex.match(table_id))
 
+
 def extract_short_table_name(table_id):
     clean = table_id.strip().strip("`").strip()
     return clean.split(".")[-1].lower()
+
 
 def is_valid_user(user):
     if not user:
         return False
     return bool(USER_REGEX.match(user.strip()))
 
+
 def is_sensitive_column(column):
     return bool(column and column.lower() in SENSITIVE_COLUMNS)
 
+
 # ============================================================
-# SECTION 5 — CACHES (FIX #6: schema cache)
+# SECTION 6 — CACHES
 # ============================================================
 def get_table_column_mapping(table_id):
     cleaned_table = clean_table_id(table_id)
     short_name = extract_short_table_name(cleaned_table)
     bq_table_name = TABLE_TO_BQ_TABLE_NAME.get(short_name, cleaned_table)
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(BANGKOK_TZ)
     with _MAPPING_CACHE_LOCK:
         cached = _MAPPING_CACHE.get(bq_table_name)
         if cached:
@@ -383,9 +537,9 @@ def get_table_column_mapping(table_id):
         logger.error(f"Error fetching column mapping from Firestore: {e}", exc_info=True)
         return {}
 
+
 def get_table_schema(table_ref):
-    """✅ FIX #6: cache BQ schema (TTL 1h)"""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(BANGKOK_TZ)
     with _SCHEMA_CACHE_LOCK:
         cached = _SCHEMA_CACHE.get(table_ref)
         if cached:
@@ -402,25 +556,27 @@ def get_table_schema(table_ref):
         logger.error(f"[Schema] Failed to fetch schema for {table_ref}: {e}")
         return {}
 
+
 # ============================================================
-# SECTION 6 — LOG ID GENERATOR
+# SECTION 7 — LOG ID GENERATOR
 # ============================================================
 def generate_ai_log_id():
     return uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
 
+
 # ============================================================
-# SECTION 7 — JWT & USERNAME LOOKUP (FIX #1: async/sync split)
+# SECTION 8 — JWT & USERNAME LOOKUP
 # ============================================================
 def extract_email_from_jwt(token):
-    """ถอด email จาก JWT — ถ้าไม่มี LIBRECHAT_JWT_SECRET ให้ reject token ทันที (ไม่รับ unsigned)"""
     if not token:
         return None
-    if not LIBRECHAT_JWT_SECRET:
-        logger.warning("[JWT] LIBRECHAT_JWT_SECRET not configured — rejecting token to prevent unsigned-claim bypass")
-        return None
     try:
-        if True:  # always verified when secret is set
+        import jwt as pyjwt
+        if LIBRECHAT_JWT_SECRET:
             payload = pyjwt.decode(token, LIBRECHAT_JWT_SECRET, algorithms=["HS256", "HS384", "HS512"])
+        else:
+            payload = pyjwt.decode(token, options={"verify_signature": False},
+                                   algorithms=["HS256", "HS384", "HS512", "RS256"])
 
         email = payload.get("email") or payload.get("user_email") or payload.get("preferred_username")
         if not email:
@@ -436,18 +592,14 @@ def extract_email_from_jwt(token):
         logger.warning(f"[JWT] Failed to decode token: {type(e).__name__}: {e}")
         return None
 
+
 def _lookup_username_sync(email):
-    """
-    ✅ FIX #1 + FIX #4: core sync implementation
-    ใช้จาก lookup_username_async() (ผ่าน to_thread) 
-    หรือ tool handler (def, sync)
-    """
     if not is_valid_email(email):
         logger.warning(f"[lookup_username] Invalid email skipped: '{email}'")
         return None
 
     email_lower = email.strip().lower()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(BANGKOK_TZ)
 
     with _USERNAME_CACHE_LOCK:
         cached = _USERNAME_CACHE.get(email_lower)
@@ -470,7 +622,6 @@ def _lookup_username_sync(email):
         results = list(bq_client.query(query, job_config=job_config).result())
         username = results[0]["UserName"] if results else None
 
-        # ✅ FIX #11: cache ทั้ง positive และ negative
         with _USERNAME_CACHE_LOCK:
             _USERNAME_CACHE[email_lower] = (username, now + USERNAME_CACHE_TTL)
 
@@ -483,17 +634,17 @@ def _lookup_username_sync(email):
         logger.error(f"[lookup_username] BQ error: {e}", exc_info=True)
         return None
 
+
 async def lookup_username_async(email):
-    """✅ FIX #1: async wrapper"""
     return await asyncio.to_thread(_lookup_username_sync, email)
 
-# Backward-compat
+
 def lookup_username_from_email(email):
-    """Sync version — ใช้ใน sync context"""
     return _lookup_username_sync(email)
 
+
 # ============================================================
-# SECTION 8 — SESSION TOKEN (FIX #2: ไม่ leak secret)
+# SECTION 9 — SESSION TOKEN
 # ============================================================
 def _make_session_token():
     if not CLEANUP_SECRET:
@@ -501,9 +652,10 @@ def _make_session_token():
     nonce = secrets.token_urlsafe(16)
     timestamp = str(int(time.time()))
     payload = f"{nonce}:{timestamp}"
-    signature = hmac.HMAC(CLEANUP_SECRET.encode(), payload.encode(), hashlib.sha256).digest()
+    signature = hmac.new(CLEANUP_SECRET.encode(), payload.encode(), hashlib.sha256).digest()
     sig_b64 = base64.urlsafe_b64encode(signature).decode().rstrip("=")
     return f"{payload}:{sig_b64}"
+
 
 def _verify_session_token(token):
     if not CLEANUP_SECRET or not token:
@@ -516,30 +668,31 @@ def _verify_session_token(token):
         if int(time.time()) - int(timestamp) > SESSION_MAX_AGE:
             return False
         payload = f"{nonce}:{timestamp}"
-        expected_sig = hmac.HMAC(CLEANUP_SECRET.encode(), payload.encode(), hashlib.sha256).digest()
+        expected_sig = hmac.new(CLEANUP_SECRET.encode(), payload.encode(), hashlib.sha256).digest()
         actual_sig = base64.urlsafe_b64decode(sig_b64 + "==")
         return hmac.compare_digest(expected_sig, actual_sig)
     except Exception:
         return False
 
+
 def _is_authenticated_for_files(x_cleanup_token, token_query, session_cookie):
-    """✅ FIX #2: 3 sources auth; bypass ถ้าไม่ตั้ง secret (เดิม); ✅ FIX: timing-safe compare"""
     if not CLEANUP_SECRET:
         return True
-    # Use hmac.compare_digest for timing-attack-safe comparison
-    if x_cleanup_token and hmac.compare_digest(x_cleanup_token, CLEANUP_SECRET):
+    if x_cleanup_token == CLEANUP_SECRET:
         return True
-    if token_query and hmac.compare_digest(token_query, CLEANUP_SECRET):
+    if token_query == CLEANUP_SECRET:
         return True
     if session_cookie and _verify_session_token(session_cookie):
         return True
     return False
 
+
 # ============================================================
-# SECTION 9 — MCP SERVER & FASTAPI APP
+# SECTION 10 — MCP SERVER & FASTAPI APP
 # ============================================================
 mcp = FastMCP("sc-report-server", stateless_http=True, json_response=True, host="0.0.0.0")
 mcp_asgi_app = mcp.streamable_http_app()
+
 
 @asynccontextmanager
 async def lifespan(app):
@@ -550,14 +703,14 @@ async def lifespan(app):
     finally:
         logger.info("App shutting down")
 
+
 app = FastAPI(
     title="SC Report MCP API & Server",
     description="API & MCP Server สำหรับตรวจสอบสิทธิ์และสร้าง Excel Report จาก BigQuery",
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
-# ✅ FIX #4: CORS เข้มงวด
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://ai-uat.scasset.com"],
@@ -567,15 +720,15 @@ app.add_middleware(
     max_age=3600,
 )
 
+
 # ============================================================
-# SECTION 10 — MIDDLEWARE (FIX #9: BaseHTTPMiddleware + ตัด log PII)
+# SECTION 11 — MIDDLEWARE
 # ============================================================
 class CaptureUsernameMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         username_val = None
         email_source = "none"
 
-        # 1) Header
         for header_name in ["current-user", "current_user", "x-user-email"]:
             val = request.headers.get(header_name, "").strip()
             if val:
@@ -588,7 +741,6 @@ class CaptureUsernameMiddleware(BaseHTTPMiddleware):
                         f"[Middleware] Header '{header_name}' has invalid value — skipping"
                     )
 
-        # 2) JWT
         if not username_val:
             auth_header = request.headers.get("authorization", "").strip()
             if auth_header.lower().startswith("bearer "):
@@ -606,7 +758,6 @@ class CaptureUsernameMiddleware(BaseHTTPMiddleware):
 
         token_username = CURRENT_REQUEST_USERNAME.set(username_val)
 
-        # 3) Resolve BQ username
         bq_username = None
         if username_val:
             bq_username = await lookup_username_async(username_val)
@@ -627,10 +778,10 @@ class CaptureUsernameMiddleware(BaseHTTPMiddleware):
             CURRENT_REQUEST_BQ_USERNAME.reset(token_bq_username)
             CURRENT_REQUEST_BASE_URL.reset(token_base)
 
+
 class BlockSSEMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
-        # if request.method == "GET" and request.url.path.rstrip("/") == "/ /sse":
-        if request.method == "GET" and request.url.path.rstrip("/") in ("/mcp", "/mcp/sse"):
+        if request.method == "GET" and request.url.path.rstrip("/") == "/mcp/sse":
             return JSONResponse(
                 status_code=405,
                 content={"detail": "SSE transport is disabled. Use POST /mcp for Streamable HTTP."},
@@ -638,21 +789,24 @@ class BlockSSEMiddleware(BaseHTTPMiddleware):
             )
         return await call_next(request)
 
+
 app.add_middleware(CaptureUsernameMiddleware)
 app.add_middleware(BlockSSEMiddleware)
 
+
 # ============================================================
-# SECTION 11 — PYDANTIC MODELS
+# SECTION 12 — PYDANTIC MODELS
 # ============================================================
 AllowedOperators = Literal["=", ">", "<", ">=", "<=", "LIKE", "!="]
+
 
 class FilterCondition(BaseModel):
     column: str = Field(..., min_length=1, description="ชื่อคอลัมน์ที่จะฟิลเตอร์")
     operator: AllowedOperators = Field(default="=", description="เครื่องหมายเปรียบเทียบ")
     value: str = Field(..., description="ค่าที่ใช้ค้นหา")
 
+
 class GenerateReportRequest(BaseModel):
-    # ✅ FIX #16: เก็บ username/user_email fields ไว้เหมือนเดิม (backward-compat)
     model_config = ConfigDict(extra="allow")
     table_id: str = Field(..., min_length=1)
     limit: int = Field(default=2000, gt=0, le=100000)
@@ -663,8 +817,7 @@ class GenerateReportRequest(BaseModel):
     user_email: Optional[str] = None
     filter_column: Optional[str] = None
     filter_value: Optional[str] = None
-    send_email: Optional[bool] = False
-    email_to: Optional[str] = None
+
 
 class CostEstimateRequest(BaseModel):
     bytes_billed: int = Field(..., ge=0)
@@ -672,6 +825,7 @@ class CostEstimateRequest(BaseModel):
     vcpu: float = Field(default=1.0, gt=0)
     memory_gib: float = Field(default=0.5, gt=0)
     usd_to_thb: float = Field(default=32.57, gt=0)
+
 
 class GenerateChartRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -685,14 +839,12 @@ class GenerateChartRequest(BaseModel):
     user_email: Optional[str] = None
     filter_column: Optional[str] = None
     filter_value: Optional[str] = None
-    send_email: Optional[bool] = False
-    email_to: Optional[str] = None
+
 
 # ============================================================
-# SECTION 12 — AUTH & RESOLUTION (FIX #1)
+# SECTION 13 — AUTH & RESOLUTION
 # ============================================================
 def _resolve_username_sync(fallback_email=None):
-    """Sync version — ใช้ใน tool handlers (def, sync context)"""
     bq_username = CURRENT_REQUEST_BQ_USERNAME.get()
     if bq_username and is_valid_user(bq_username):
         return bq_username.strip()
@@ -710,10 +862,10 @@ def _resolve_username_sync(fallback_email=None):
     )
     return ""
 
-# Backward-compat
+
 def resolve_username(fallback_email=None):
-    """Sync entry — ตาม signature เดิม"""
     return _resolve_username_sync(fallback_email)
+
 
 def check_user_permission(username, table_id):
     if not is_valid_user(username):
@@ -757,6 +909,7 @@ def check_user_permission(username, table_id):
         logger.error(f"Auth verification database error: {e}")
         return None
 
+
 def validate_filter_column(table_id, column):
     if not table_id or not column:
         return False
@@ -764,8 +917,9 @@ def validate_filter_column(table_id, column):
     target_column = column.lower()
     return any(k.lower() == target_column for k in mapping_dict.keys())
 
+
 # ============================================================
-# SECTION 13 — AI LOG (FIX #15: ใช้ BANGKOK_TZ)
+# SECTION 14 — AI LOG
 # ============================================================
 def insert_ai_log(
     username, table_name, report_name, status,
@@ -773,7 +927,6 @@ def insert_ai_log(
     row_generated=0, ai_log_id=0, cost_thb=0.0, cost_usd=0.0, cost_summary="",
 ):
     try:
-        # ✅ FIX #15: ใช้ BANGKOK_TZ
         now = datetime.now(BANGKOK_TZ)
         if ai_log_id == 0:
             ai_log_id = generate_ai_log_id()
@@ -801,8 +954,9 @@ def insert_ai_log(
     except Exception as e:
         logger.error(f"Exception in insert_ai_log: {e}", exc_info=True)
 
+
 # ============================================================
-# SECTION 14 — PARAM MAPPER (FIX #5: INT64 range + finite float)
+# SECTION 15 — PARAM MAPPER
 # ============================================================
 def map_param_type_and_value(column_name, str_val, schema_dict):
     col_type = schema_dict.get(column_name.lower())
@@ -832,11 +986,11 @@ def map_param_type_and_value(column_name, str_val, schema_dict):
 
     return "STRING", str_val
 
+
 # ============================================================
-# SECTION 15 — QUERY BUILDER (FIX #8: shared + ใช้ schema cache)
+# SECTION 16 — QUERY BUILDER
 # ============================================================
 def _validate_columns(short_name, columns):
-    """✅ FIX #13: ใช้ is_sensitive_column"""
     if not columns:
         return
     for col in columns:
@@ -846,9 +1000,9 @@ def _validate_columns(short_name, columns):
             raise PermissionError(f"คอลัมน์ '{col}' ไม่ได้รับอนุญาต")
         sanitize_column_name(col)
 
+
 def _build_query_and_params(table_id, limit, filter_column, filter_value,
                              filters, columns, condition):
-    """✅ FIX #8: shared query builder + ใช้ schema cache"""
     clean = clean_table_id(table_id)
     if not validate_table_id(clean):
         raise PermissionError(f"โครงสร้าง Table ID '{table_id}' ไม่ถูกต้องหรือไม่อนุญาตให้เข้าถึง")
@@ -859,7 +1013,7 @@ def _build_query_and_params(table_id, limit, filter_column, filter_value,
 
     bq_table_name = TABLE_TO_BQ_TABLE_NAME.get(short_name, clean)
     table_ref = f"{PROJECT_ID}.{DATASET_ID}.{bq_table_name}"
-    schema_dict = get_table_schema(table_ref)  # ✅ ใช้ cache
+    schema_dict = get_table_schema(table_ref)
 
     _validate_columns(short_name, columns)
 
@@ -906,8 +1060,9 @@ def _build_query_and_params(table_id, limit, filter_column, filter_value,
 
     return query, params, bq_table_name, schema_dict
 
+
 # ============================================================
-# SECTION 16 — FETCH & GENERATE EXCEL
+# SECTION 17 — FETCH & GENERATE EXCEL  (ใช้ GCS)
 # ============================================================
 def fetch_and_generate_excel(
     table_id, report_name, limit=2000,
@@ -918,6 +1073,7 @@ def fetch_and_generate_excel(
         table_id, limit, filter_column, filter_value, filters, columns, condition
     )
     actual_sql_executed = query
+
     job_config = bigquery.QueryJobConfig(query_parameters=params)
     job = bq_client.query(query, job_config=job_config)
     result = job.result()
@@ -925,6 +1081,9 @@ def fetch_and_generate_excel(
     bytes_billed = job.total_bytes_billed
     schema = result.schema
     row_count = result.total_rows
+
+    if not row_count:
+        return 0, None, bytes_billed, 0.0, actual_sql_executed, generate_ai_log_id()
 
     wb = Workbook(write_only=True)
     ws = wb.create_sheet(title="Report")
@@ -938,7 +1097,6 @@ def fetch_and_generate_excel(
         headers.append(translated_header)
     ws.append(headers)
 
-    row_count = 0
     for row in result:
         row_values = []
         for field in schema:
@@ -947,72 +1105,37 @@ def fetch_and_generate_excel(
                 val = val.replace(tzinfo=None)
             row_values.append(val)
         ws.append(row_values)
-        row_count += 1
-
-    if not row_count:
-        return 0, None, bytes_billed, 0.0, actual_sql_executed, generate_ai_log_id()
 
     ai_log_id = generate_ai_log_id()
     secure_file_id = uuid.uuid4().hex[:8]
-    # ✅ FIX #15: ใช้ BANGKOK_TZ
     timestamp = datetime.now(BANGKOK_TZ).strftime("%Y%m%d_%H%M%S")
     file_name = f"{bq_table_name}_{secure_file_id}_{timestamp}.xlsx"
 
-    file_path = REPORT_DIR / file_name
-    wb.save(file_path)
+    # บันทึกลง /tmp ชั่วคราว แล้วอัปโหลด GCS
+    local_path = REPORT_DIR / file_name
+    wb.save(local_path)
+    file_size_mb = round(local_path.stat().st_size / (1024 * 1024), 4)
 
-    file_size_mb = round(file_path.stat().st_size / (1024 * 1024), 4)
+    upload_to_gcs(local_path, file_name)   # ← อัปโหลด + ลบ /tmp อัตโนมัติ
+
     return row_count, file_name, bytes_billed, file_size_mb, actual_sql_executed, ai_log_id
 
+
 # ============================================================
-# SECTION 17 — CLEANUP
+# SECTION 18 — CLEANUP  (ใช้ GCS)
 # ============================================================
 def cleanup_old_reports():
-    cleanup_strategy = os.environ.get("CLEANUP_STRATEGY", "age").lower()
-    cleanup_age_seconds = int(os.environ.get("CLEANUP_AGE_SECONDS", "86400"))
-    cleanup_max_files = int(os.environ.get("CLEANUP_MAX_FILES", "20"))
-
-    logger.info(f"Cleanup: strategy={cleanup_strategy}")
-    if not REPORT_DIR.exists():
-        return
-
-    current_time = time.time()
-    deleted = 0
-
-    if cleanup_strategy not in ["age", "keep_latest", "aggressive"]:
-        cleanup_strategy = "age"
-
-    if cleanup_strategy == "age":
-        cutoff = current_time - cleanup_age_seconds
-        files_list = list(REPORT_DIR.glob("*.xlsx")) + list(REPORT_DIR.glob("*.png"))
-        for file_path in files_list:
-            if file_path.is_file() and file_path.stat().st_mtime < cutoff:
-                file_path.unlink()
-                deleted += 1
-    elif cleanup_strategy == "keep_latest":
-        files = list(REPORT_DIR.glob("*.xlsx")) + list(REPORT_DIR.glob("*.png"))
-        sorted_files = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
-        for file_path in sorted_files[cleanup_max_files:]:
-            if file_path.is_file():
-                file_path.unlink()
-                deleted += 1
-    elif cleanup_strategy == "aggressive":
-        files_list = list(REPORT_DIR.glob("*.xlsx")) + list(REPORT_DIR.glob("*.png"))
-        for file_path in files_list:
-            if file_path.is_file():
-                file_path.unlink()
-                deleted += 1
-
+    deleted = cleanup_gcs_files()
     logger.info(f"Cleanup completed — {deleted} file(s) removed.")
 
+
 # ============================================================
-# SECTION 18 — REPORT GENERATION (orchestrator)
+# SECTION 19 — REPORT GENERATION (orchestrator)
 # ============================================================
 def _execute_report_generation(
     table_id, limit=2000, filter_column=None, filter_value=None,
     filters=None, columns=None, username=None,
     user_email=None, condition="AND",
-    send_email: bool = False, email_to: Optional[str] = None,
 ):
     _start_time = time.perf_counter()
 
@@ -1074,70 +1197,13 @@ def _execute_report_generation(
                       row_generated=row_count or 0, ai_log_id=ai_log_id,
                       cost_thb=cost.grand_total_thb, cost_usd=cost.grand_total_usd,
                       cost_summary=cost.summary)
-
-        # ── Email delivery (optional) ─────────────────────────────
-        email_sent = False
-        email_note = ""
-        if send_email:
-            # Priority: explicit email_to (user พิมพ์มา) → middleware email (session)
-            recipient = None
-            middleware_email = CURRENT_REQUEST_USERNAME.get() or ""
-            # Unmask LibreChat email masking [EMAIL_MASKED_xxx@yyy.com] → xxx@yyy.com
-            email_to_clean = unmask_librechat_email(email_to) if email_to else None
-            logger.info(f"[Email-DEBUG] email_to raw='{email_to}' clean='{mask_username(email_to_clean or '')}' | is_valid={is_valid_email(email_to_clean or '')} | middleware='{mask_username(middleware_email)}'")
-            if email_to_clean and is_valid_email(email_to_clean):
-                recipient = email_to_clean
-                logger.info(f"[Email] Using explicit email_to as recipient: {mask_username(recipient)}")
-            elif is_valid_email(middleware_email):
-                recipient = middleware_email
-                logger.info(f"[Email] Using middleware email as recipient: {mask_username(recipient)}")
-
-            if recipient:
-                file_path = REPORT_DIR / file_name
-                subject = f"[SC Report] {report_name} — {datetime.now(BANGKOK_TZ).strftime('%d/%m/%Y %H:%M')}"
-                # ถ้าไฟล์ใหญ่เกิน 20MB → ส่ง link แทน พร้อมเตือนให้โหลดเร็ว
-                EMAIL_ATTACH_LIMIT_MB = 20
-                file_size_for_email = file_path.stat().st_size / (1024 * 1024) if file_path.exists() else 0
-                if file_path.exists() and file_size_for_email < EMAIL_ATTACH_LIMIT_MB:
-                    body = (
-                        f"เรียนคุณ {username_to_use},\n\n"
-                        f"รายงาน '{report_name}' ({row_count:,} แถว) พร้อมแล้วครับ\n"
-                        f"กรุณาเปิดไฟล์ Excel ที่แนบมากับอีเมลฉบับนี้ได้เลยครับ\n\n"
-                        f"ขอบคุณครับ\nSC Report Bot"
-                    )
-                    email_sent = send_report_email(file_path, file_name, recipient, subject, body)
-                    email_note = f" | ส่งอีเมล (พร้อมไฟล์แนบ) ไปยัง {mask_username(recipient)}: {'สำเร็จ ✅' if email_sent else 'ไม่สำเร็จ ❌'}"
-                elif file_path.exists():
-                    # ไฟล์ใหญ่เกิน 20MB — ส่งแค่ link พร้อมคำเตือน
-                    logger.info(f"[Email] File too large for attachment ({file_size_for_email:.1f} MB) — sending link only")
-                    body = (
-                        f"เรียนคุณ {username_to_use},\n\n"
-                        f"รายงาน '{report_name}' ({row_count:,} แถว) พร้อมแล้วครับ\n\n"
-                        f"⚠️ ไฟล์มีขนาด {file_size_for_email:.1f} MB ใหญ่เกินกว่าจะแนบในอีเมลได้\n"
-                        f"กรุณาดาวน์โหลดจากลิงก์ด้านล่างโดยเร็ว เนื่องจากลิงก์จะหมดอายุเมื่อระบบไม่มีผู้ใช้งาน:\n\n"
-                        f"{download_url}\n\n"
-                        f"ขอบคุณครับ\nSC Report Bot"
-                    )
-                    email_sent = send_report_email(None, None, recipient, subject, body)
-                    email_note = f" | ส่งอีเมล (ลิงก์อย่างเดียว ไฟล์ใหญ่ {file_size_for_email:.1f} MB) ไปยัง {mask_username(recipient)}: {'สำเร็จ ✅' if email_sent else 'ไม่สำเร็จ ❌'}"
-                else:
-                    logger.error("[Email] Local file not found after generation — cannot send")
-                    email_sent = False
-                    email_note = f" | ส่งอีเมลไปยัง {mask_username(recipient)}: ไม่สำเร็จ ❌ (ไฟล์หายก่อนส่ง)"
-            else:
-                email_note = " | ไม่สามารถส่งอีเมล: ไม่พบอีเมลปลายทางที่ถูกต้อง"
-        # ─────────────────────────────────────────────────────────
-
-        result: dict = {
+        return {
             "success": True,
-            "message": f"จัดเตรียมรายงาน{report_name} ({row_count} แถว) สำเร็จ{email_note}",
+            "message": f"จัดเตรียมรายงาน{report_name} ({row_count} แถว) สำเร็จ",
             "download_url": download_url, "file_name": file_name,
             "row_count": row_count, "file_size_mb": file_size_mb,
             "report_name": report_name, "cost": cost_breakdown,
         }
-        if send_email:
-            result["email_sent"] = email_sent
-        return result
 
     except PermissionError as pe:
         insert_ai_log(username_to_use, bq_table_name, report_name or "", "FAIL")
@@ -1146,6 +1212,7 @@ def _execute_report_generation(
         logger.error(f"Execution Error: {e}", exc_info=True)
         insert_ai_log(username_to_use, bq_table_name, report_name or "", "FAIL")
         return {"success": False, "message": "พบปัญหาการสร้าง Excel"}
+
 
 def fetch_dataframe_for_chart(
     table_id, limit=2000, filter_column=None, filter_value=None,
@@ -1161,11 +1228,11 @@ def fetch_dataframe_for_chart(
     bytes_billed = job.total_bytes_billed
     return df, bytes_billed, actual_sql_executed
 
+
 def _execute_chart_generation(
     table_id, code, limit=2000, filter_column=None, filter_value=None,
     filters=None, columns=None, username=None,
     user_email=None, condition="AND",
-    send_email: bool = False, email_to: Optional[str] = None,
 ) -> dict:
     _start_time = time.perf_counter()
 
@@ -1225,10 +1292,9 @@ def _execute_chart_generation(
         secure_file_id = uuid.uuid4().hex[:8]
         timestamp = datetime.now(BANGKOK_TZ).strftime("%Y%m%d_%H%M%S")
         file_name = f"chart_{bq_table_name}_{secure_file_id}_{timestamp}.png"
-        file_path = REPORT_DIR / file_name
+        local_path = REPORT_DIR / file_name
 
-        # Pass column_labels (EN→TH mapping) so sandbox can inject it as a variable
-        res = run_visualization_code(df, code, str(file_path), column_labels=raw_mapping)
+        res = run_visualization_code(df, code, str(local_path))
 
         _elapsed = time.perf_counter() - _start_time
         cost = calculate_total_cost(bytes_billed=bytes_billed, duration_seconds=_elapsed,
@@ -1241,19 +1307,20 @@ def _execute_chart_generation(
                           condition=actual_sql, bytes_billed=bytes_billed, ai_log_id=ai_log_id,
                           cost_thb=cost.grand_total_thb, cost_usd=cost.grand_total_usd,
                           cost_summary=cost.summary)
-            
-            # ✅ FIX: ส่ง column names + sample กลับไปให้ AI เห็นทันที
             sample_data = df.head(3).to_dict('records')
             return {
                 "success": False,
                 "message": f"วาดกราฟไม่สำเร็จ: {res['message']}",
-                "available_columns": list(df.columns),  # ← สำคัญ!
-                "sample_data": sample_data,  # ← sample 3 แถวแรก
+                "available_columns": list(df.columns),
+                "sample_data": sample_data,
                 "row_count": len(df),
                 "hint": "ใช้ชื่อ column จาก available_columns เท่านั้น (ชื่อภาษาไทยที่แปลแล้ว)"
             }
 
-        file_size_mb = round(file_path.stat().st_size / (1024 * 1024), 4)
+        file_size_mb = round(local_path.stat().st_size / (1024 * 1024), 4)
+
+        upload_to_gcs(local_path, file_name)   # ← อัปโหลด + ลบ /tmp อัตโนมัติ
+
         base_url = CURRENT_REQUEST_BASE_URL.get() or PUBLIC_BASE_URL
         download_url = f"{base_url.rstrip('/')}/download/{file_name}"
 
@@ -1264,79 +1331,28 @@ def _execute_chart_generation(
                       cost_thb=cost.grand_total_thb, cost_usd=cost.grand_total_usd,
                       cost_summary=cost.summary)
 
-        # ── Email delivery for chart (optional) ──────────────────
-        email_sent = False
-        email_note = ""
-        if send_email:
-            # Priority: explicit email_to (user พิมพ์มา) → middleware email (session)
-            recipient = None
-            middleware_email = CURRENT_REQUEST_USERNAME.get() or ""
-            # Unmask LibreChat email masking [EMAIL_MASKED_xxx@yyy.com] → xxx@yyy.com
-            email_to_clean = unmask_librechat_email(email_to) if email_to else None
-            if email_to_clean and is_valid_email(email_to_clean):
-                recipient = email_to_clean
-                logger.info(f"[Email] Using explicit email_to as recipient: {mask_username(recipient)}")
-            elif is_valid_email(middleware_email):
-                recipient = middleware_email
-                logger.info(f"[Email] Using middleware email as recipient: {mask_username(recipient)}")
-
-            if recipient:
-                subject = f"[SC Report] แผนภูมิ {report_name} — {datetime.now(BANGKOK_TZ).strftime('%d/%m/%Y %H:%M')}"
-                EMAIL_ATTACH_LIMIT_MB = 20
-                file_size_for_email = file_path.stat().st_size / (1024 * 1024) if file_path.exists() else 0
-                if file_path.exists() and file_size_for_email < EMAIL_ATTACH_LIMIT_MB:
-                    body = (
-                        f"เรียนคุณ {username_to_use},\n\n"
-                        f"แผนภูมิของรายงาน '{report_name}' ({len(df):,} แถว) พร้อมแล้วครับ\n"
-                        f"กรุณาเปิดไฟล์รูปภาพที่แนบมากับอีเมลฉบับนี้ได้เลยครับ\n\n"
-                        f"ขอบคุณครับ\nSC Report Bot"
-                    )
-                    email_sent = send_report_email(file_path, file_name, recipient, subject, body)
-                    email_note = f" | ส่งอีเมล (พร้อมไฟล์แนบ) ไปยัง {mask_username(recipient)}: {'สำเร็จ ✅' if email_sent else 'ไม่สำเร็จ ❌'}"
-                elif file_path.exists():
-                    logger.info(f"[Email] Chart file too large for attachment ({file_size_for_email:.1f} MB) — sending link only")
-                    body = (
-                        f"เรียนคุณ {username_to_use},\n\n"
-                        f"แผนภูมิของรายงาน '{report_name}' ({len(df):,} แถว) พร้อมแล้วครับ\n\n"
-                        f"⚠️ ไฟล์มีขนาด {file_size_for_email:.1f} MB ใหญ่เกินกว่าจะแนบในอีเมลได้\n"
-                        f"กรุณาดาวน์โหลดจากลิงก์ด้านล่างโดยเร็ว เนื่องจากลิงก์จะหมดอายุเมื่อระบบไม่มีผู้ใช้งาน:\n\n"
-                        f"{download_url}\n\n"
-                        f"ขอบคุณครับ\nSC Report Bot"
-                    )
-                    email_sent = send_report_email(None, None, recipient, subject, body)
-                    email_note = f" | ส่งอีเมล (ลิงก์อย่างเดียว ไฟล์ใหญ่ {file_size_for_email:.1f} MB) ไปยัง {mask_username(recipient)}: {'สำเร็จ ✅' if email_sent else 'ไม่สำเร็จ ❌'}"
-                else:
-                    logger.error("[Email] Chart file not found — cannot send")
-                    email_sent = False
-                    email_note = f" | ส่งอีเมลไปยัง {mask_username(recipient)}: ไม่สำเร็จ ❌ (ไฟล์หายก่อนส่ง)"
-            else:
-                email_note = " | ไม่สามารถส่งอีเมล: ไม่พบอีเมลปลายทางที่ถูกต้อง"
-        # ─────────────────────────────────────────────────────────
-
-        chart_result: dict = {
+        return {
             "success": True,
-            "message": f"จัดเตรียมรายงานแผนภูมิของ{report_name} สำเร็จ{email_note}",
+            "message": f"จัดเตรียมรายงานแผนภูมิของ{report_name} สำเร็จ",
             "download_url": download_url, "file_name": file_name,
             "row_count": len(df), "file_size_mb": file_size_mb,
             "report_name": report_name, "cost": cost_breakdown,
             "available_columns": list(df.columns),
         }
-        if send_email:
-            chart_result["email_sent"] = email_sent
-        return chart_result
 
     except Exception as e:
         logger.error(f"Chart Execution Error: {e}", exc_info=True)
         insert_ai_log(username_to_use, bq_table_name, report_name or "", "FAIL_CHART")
         return {"success": False, "message": f"พบปัญหาการดึงข้อมูลเพื่อวาดกราฟ: {str(e)}"}
 
+
 # ============================================================
-# SECTION 19 — MCP TOOLS (เก็บ signature เดิมที่ทำงานได้ทั้งหมด)
+# SECTION 20 — MCP TOOLS
 # ============================================================
 @mcp.tool(name="sc_report_export", description="ดึงข้อมูล SC Report และสร้างไฟล์ Excel")
 def mcp_sc_report_export(
     table_id: str,
-    username: str,  # ✅ คง signature เดิม
+    username: str,
     limit: int = 2000,
     filter_column: Optional[str] = None,
     filter_value: Optional[str] = None,
@@ -1360,15 +1376,8 @@ def mcp_sc_report_export(
         res["cost_summary"] = res["cost"].get("summary", "")
     return res
 
-@mcp.tool(
-    name="generate_excel_report",
-    description=(
-        "สร้างไฟล์ Excel จากรายงานใน BigQuery\n\n"
-        "📧 ส่งอีเมล: ตั้ง send_email=true เพื่อส่งไฟล์ไปยังอีเมลของผู้ใช้โดยอัตโนมัติ "
-        "(ระบบดึงอีเมลจาก login session อัตโนมัติ ไม่ต้องระบุ email_to — "
-        "ระบุ email_to เฉพาะเมื่อผู้ใช้ต้องการส่งไปยังอีเมลอื่นที่พิมพ์มาให้ครบเท่านั้น)"
-    )
-)
+
+@mcp.tool(name="generate_excel_report", description="สร้างไฟล์ Excel จากรายงานใน BigQuery")
 def mcp_generate_excel_report(
     table_id: str,
     limit: int = 2000,
@@ -1379,8 +1388,6 @@ def mcp_generate_excel_report(
     username: Optional[str] = None,
     user_email: Optional[str] = None,
     columns: Optional[list[str]] = None,
-    send_email: bool = False,
-    email_to: Optional[str] = None,
     **kwargs,
 ) -> str:
     parsed_filters = None
@@ -1394,7 +1401,6 @@ def mcp_generate_excel_report(
         table_id=table_id, limit=limit, filter_column=filter_column,
         filter_value=filter_value, filters=parsed_filters, columns=columns,
         username=username, user_email=user_email, condition=condition or "AND",
-        send_email=send_email, email_to=email_to,
     )
     if res["success"]:
         cost_line = ""
@@ -1405,14 +1411,12 @@ def mcp_generate_excel_report(
                 f"Cloud Run ${c['cloud_run']['total_cost_usd']:.6f} | "
                 f"รวม ฿{c['grand_total_thb']:.4f}"
             )
-        email_line = ""
-        if send_email:
-            email_line = "\n" + ("📧 ส่งอีเมลเรียบร้อยแล้ว ✅" if res.get("email_sent") else "⚠️ ส่งอีเมลไม่สำเร็จ")
         return (
             f"จัดเตรียม **รายงาน{res['report_name']}** ({res['row_count']} แถว) เรียบร้อยแล้วครับ\n"
-            f"{res['download_url']}\n{cost_line}{email_line}"
+            f"{res['download_url']}\n{cost_line}"
         )
     return res["message"]
+
 
 @mcp.tool(
     name="generate_chart_report",
@@ -1422,8 +1426,7 @@ def mcp_generate_excel_report(
         "- ชื่อ column ใน DataFrame จะถูกแปลเป็นภาษาไทยตาม data dictionary อัตโนมัติ\n"
         "- ต้องใช้ชื่อ column ภาษาไทยในโค้ด เช่น 'ชื่อกลุ่มงาน' ไม่ใช่ 'WorkGroupName'\n"
         "- ถ้าโค้ด error ระบบจะ return available_columns ให้ใช้ชื่อจากตรงนั้น\n"
-        "- ห้ามเรียก plt.show() หรือ plt.savefig() เด็ดขาด — ระบบหลังบ้านจัดการบันทึกไฟล์เอง\n"
-        "- โค้ดต้องลงท้ายด้วย plt.tight_layout() เท่านั้น"
+        "- โค้ดต้องมี plt.savefig() หรือ savefig() ก่อน plt.show()"
     )
 )
 def mcp_generate_chart_report(
@@ -1437,8 +1440,6 @@ def mcp_generate_chart_report(
     username: Optional[str] = None,
     user_email: Optional[str] = None,
     columns: Optional[list[str]] = None,
-    send_email: bool = False,
-    email_to: Optional[str] = None,
     **kwargs,
 ) -> str:
     parsed_filters = None
@@ -1452,7 +1453,6 @@ def mcp_generate_chart_report(
         table_id=table_id, code=code, limit=limit, filter_column=filter_column,
         filter_value=filter_value, filters=parsed_filters, columns=columns,
         username=username, user_email=user_email, condition=condition or "AND",
-        send_email=send_email, email_to=email_to,
     )
 
     if res["success"]:
@@ -1467,12 +1467,10 @@ def mcp_generate_chart_report(
         cols_hint = ""
         if "available_columns" in res:
             cols_hint = f"\n\n📊 Columns ที่ใช้ได้: {res['available_columns']}"
-        email_line = ""
-        if send_email:
-            email_line = "\n" + ("📧 ส่งอีเมลเรียบร้อยแล้ว ✅" if res.get("email_sent") else "⚠️ ส่งอีเมลไม่สำเร็จ")
+
         return (
             f"จัดเตรียม **แผนภูมิของรายงาน{res['report_name']}** ({res['row_count']} แถว) เรียบร้อยแล้วครับ\n"
-            f"{res['download_url']}\n{cost_line}{email_line}{cols_hint}"
+            f"{res['download_url']}\n{cost_line}{cols_hint}"
         )
 
     if "available_columns" in res:
@@ -1486,31 +1484,22 @@ def mcp_generate_chart_report(
             f"{sample_str}\n\n"
             f"💡 กรุณาใช้ชื่อ column จาก available_columns เท่านั้น"
         )
+
     return res["message"]
 
-# ✅ คง signature เดิมเป๊ะ — ไม่มี parameter เลย
+
 @mcp.tool(
     name="check_accessible_reports",
-    description=(
-        "ตรวจสอบว่าผู้ใช้งานคนปัจจุบันมีสิทธิ์เข้าถึงรายงาน (ReportName / Table) ใดบ้าง "
-        "ไม่ต้องใส่พารามิเตอร์ใดๆ ระบบจะดึงจากอีเมลผู้ใช้อัตโนมัติจาก Header "
-        "Response จะมี user_email และ display_name ของผู้ใช้ด้วย เพื่อใช้สำหรับฟีเจอร์ส่งรายงานทางอีเมล"
-    )
+    description="ตรวจสอบว่าผู้ใช้งานคนปัจจุบันมีสิทธิ์เข้าถึงรายงาน (ReportName / Table) ใดบ้าง ไม่ต้องใส่พารามิเตอร์ใดๆ ระบบจะดึงจากอีเมลผู้ใช้อัตโนมัติจาก Header"
 )
 def mcp_check_accessible_reports() -> dict:
-    # resolve BQ username (ชื่อ-นามสกุล) จาก ContextVar ที่ middleware set ไว้
     username = resolve_username(None)
     if not username or username == "Anonymous" or username == "Unknown":
         return {"success": False, "message": "ไม่พบข้อมูลสิทธิ์ของผู้ใช้งาน หรือ ไม่สามารถระบุตัวตนผู้ใช้ได้"}
 
-    # ดึง email ของ user คนปัจจุบันจาก ContextVar (set โดย CaptureUsernameMiddleware)
-    user_email = CURRENT_REQUEST_USERNAME.get() or ""
-
     try:
-        # ดึง ReportName + Email จาก AuthenByMenu เฉพาะ row ของ user คนนี้
-        # SELECT Email ด้วยเพื่อยืนยัน email ที่ถูกต้องจาก DB (กรณี case ต่างกัน)
         query = f"""
-            SELECT ReportName, Email
+            SELECT ReportName 
             FROM `{PROJECT_ID}.{DATASET_ID}.{AUTH_TABLE}`
             WHERE UserName = @username
         """
@@ -1522,300 +1511,20 @@ def mcp_check_accessible_reports() -> dict:
         results = list(bq_client.query(query, job_config=job_config).result())
         reports = [row["ReportName"] for row in results]
 
-        # ใช้ email จาก DB เป็น canonical email (ถ้ามี) มิฉะนั้นใช้จาก header
-        db_email = results[0]["Email"] if results else ""
-        canonical_email = db_email.strip() if db_email else user_email.strip()
-
-        logger.info(
-            f"[check_accessible_reports] user='{username}' "
-            f"email={mask_username(canonical_email)} reports={len(reports)}"
-        )
-
         return {
             "success": True,
-            "display_name": username,          # ชื่อ-นามสกุลภาษาอังกฤษ เช่น "Kachatharn Siriwong"
-            "user_email": canonical_email,     # อีเมลสำหรับส่งรายงาน เช่น "kachatharn@scasset.com"
+            "username": username,
             "accessible_reports": reports,
-            "total": len(reports),
+            "total": len(reports)
         }
     except Exception as e:
         logger.error(f"Error fetching accessible reports: {e}")
         return {"success": False, "message": f"เกิดข้อผิดพลาดในการดึงข้อมูลสิทธิ์: {str(e)}"}
 
-# ============================================================
-# SECTION 19B — MISSING MCP TOOLS (data-poc group)
-# list_available_tables / describe_table / ask_data
-# Required by mandatory workflow (System Prompt §3)
-# ============================================================
-@mcp.tool(
-    name="list_available_tables",
-    description=(
-        "แสดงรายชื่อตารางทั้งหมดที่มีอยู่จริงใน BigQuery Dataset "
-        "ใช้เป็น Data Dictionary — ต้องเรียกก่อนเลือกตารางเสมอ ห้ามเดาชื่อตาราง\n"
-        "พารามิเตอร์ dataset (optional): เช่น 'SCReport' (default คือ dataset ของระบบ)"
-    )
-)
-def mcp_list_available_tables(dataset: Optional[str] = None) -> dict:
-    target_dataset = dataset or DATASET_ID
-    # Exact table names that are restricted — never expose these to the AI
-    _restricted_exact = {AUTH_TABLE.lower(), LOG_TABLE.lower()}
-    try:
-        tables = bq_client.list_tables(f"{PROJECT_ID}.{target_dataset}")
-        table_names = []
-        for t in tables:
-            name = t.table_id
-            if name.lower() in _restricted_exact:
-                continue
-            table_names.append(name)
-        logger.info(f"[list_available_tables] dataset='{target_dataset}' returned {len(table_names)} tables")
-        return {
-            "success": True,
-            "dataset": target_dataset,
-            "tables": sorted(table_names),
-            "total": len(table_names),
-            "note": "ใช้ชื่อตารางจากรายการนี้เท่านั้น — ห้ามเดาชื่อหรือใช้ชื่อที่ไม่ปรากฏในรายการ",
-        }
-    except Exception as e:
-        logger.error(f"[list_available_tables] Error: {e}", exc_info=True)
-        return {"success": False, "message": f"เกิดข้อผิดพลาดในการดึงรายชื่อตาราง: {str(e)}"}
-
-@mcp.tool(
-    name="describe_table",
-    description=(
-        "แสดง Schema, โครงสร้างคอลัมน์ และคำอธิบายภาษาไทยของตาราง "
-        "ต้องเรียกก่อนเขียนโค้ดกราฟหรือเลือกคอลัมน์ทุกครั้ง\n"
-        "dataset (Required): เช่น 'SCReport'\n"
-        "table (Required): ชื่อตารางจาก list_available_tables เท่านั้น"
-    )
-)
-def mcp_describe_table(dataset: str, table: str) -> dict:
-    # Block only exact restricted tables — not keyword-based (too broad, breaks legitimate tables)
-    _restricted_exact = {AUTH_TABLE.lower(), LOG_TABLE.lower()}
-    if table.lower() in _restricted_exact:
-        return {"success": False, "message": "ขออภัยครับ ตารางนี้เป็นข้อมูลระบบภายในที่ไม่อนุญาตให้เข้าถึงได้"}
-
-    table_ref = f"{PROJECT_ID}.{dataset}.{table}"
-    try:
-        bq_table = bq_client.get_table(table_ref)
-
-        # Try Firestore data dictionary first (has Thai descriptions)
-        firestore_mapping: dict[str, str] = {}
-        try:
-            doc_ref = (
-                firestore_client.collection("data_dictionary")
-                .document(dataset)
-                .collection("tables")
-                .document(table)
-            )
-            doc = doc_ref.get()
-            if doc.exists:
-                data = doc.to_dict() or {}
-                for col in data.get("columns", []):
-                    name = col.get("name")
-                    desc = col.get("description")
-                    if name and desc:
-                        firestore_mapping[name.lower()] = desc
-        except Exception as fs_err:
-            logger.warning(f"[describe_table] Firestore lookup failed: {fs_err}")
-
-        columns = []
-        for field in bq_table.schema:
-            thai_desc = firestore_mapping.get(field.name.lower(), "")
-            columns.append({
-                "name": field.name,
-                "type": field.field_type,
-                "mode": field.mode,
-                "description_th": thai_desc or field.description or "",
-            })
-
-        logger.info(f"[describe_table] {table_ref} — {len(columns)} columns")
-        return {
-            "success": True,
-            "dataset": dataset,
-            "table": table,
-            "full_table_id": table_ref,
-            "num_rows": bq_table.num_rows,
-            "columns": columns,
-            "note": (
-                "ใช้ชื่อ column ภาษาอังกฤษ (name) ใน parameters columns/filters "
-                "และใช้ description_th ในโค้ดกราฟ (DataFrame จะถูกแปลชื่อเป็นภาษาไทยให้อัตโนมัติ)"
-            ),
-        }
-    except Exception as e:
-        logger.error(f"[describe_table] Error for {table_ref}: {e}", exc_info=True)
-        return {"success": False, "message": f"เกิดข้อผิดพลาดในการดึง schema ของตาราง '{table}': {str(e)}"}
-
-@mcp.tool(
-    name="ask_data",
-    description=(
-        "ตอบคำถามเชิงวิเคราะห์ด้วยภาษาธรรมชาติ เช่น ยอดรวม นับจำนวน หาค่าเฉลี่ย สรุปข้อมูล "
-        "หรือดูข้อมูลตัวอย่างไม่เกิน 10 แถว\n"
-        "dataGroup (Required): กลุ่มข้อมูล เช่น 'SCReport'\n"
-        "question (Required): คำถามภาษาธรรมชาติ เช่น 'ยอดรวมโครงการทั้งหมดคือเท่าไหร่'\n\n"
-        "⚠️ หมายเหตุ: tool นี้รันบน BigQuery โดยตรง — ระบุชื่อ table_id ไว้ใน question เสมอ "
-        "เพื่อให้ระบบเลือกตารางได้ถูกต้อง เช่น 'ยอดรวมจากตาราง VRptExpension'"
-    )
-)
-def mcp_ask_data(dataGroup: str, question: str) -> dict:
-    """
-    Query BigQuery with a natural-language question.
-    - Verifies user permissions against accessible reports.
-    - Runs a safe LIMIT-10 SELECT query on the resolved table.
-    - Renames columns to Thai using Firestore data dictionary.
-    - Returns structured rows + metadata for AI to summarise.
-    """
-    _restricted_exact = {AUTH_TABLE.lower(), LOG_TABLE.lower()}
-
-    # Block questions probing restricted tables
-    if any(t in question.lower() for t in _restricted_exact):
-        return {"success": False, "message": "ขออภัยครับ ตารางนี้เป็นข้อมูลระบบภายในที่ไม่อนุญาตให้เข้าถึงได้"}
-
-    username = resolve_username(None)
-    if not username:
-        return {"success": False, "message": "ไม่สามารถยืนยันตัวตนได้ กรุณา Login ใหม่อีกครั้ง"}
-
-    target_dataset = dataGroup or DATASET_ID
-
-    try:
-        # ── Step 1: get user's accessible report names ───────────
-        perm_query = f"""
-            SELECT DISTINCT ReportName
-            FROM `{PROJECT_ID}.{DATASET_ID}.{AUTH_TABLE}`
-            WHERE UserName = @username
-        """
-        perm_results = list(
-            bq_client.query(
-                perm_query,
-                job_config=bigquery.QueryJobConfig(
-                    query_parameters=[bigquery.ScalarQueryParameter("username", "STRING", username)]
-                )
-            ).result()
-        )
-        accessible_reports = {row["ReportName"].lower() for row in perm_results}
-
-        if not accessible_reports:
-            return {"success": False, "message": "คุณยังไม่มีสิทธิ์เข้าถึงรายงานใด กรุณาติดต่อผู้ดูแลระบบ"}
-
-        # ── Step 2: resolve table name from question ──────────────
-        # Build reverse map: report_name_lower → bq_table_name
-        report_to_table: dict[str, str] = {}
-        for short_name, report_list in TABLE_TO_REPORT_NAMES.items():
-            bq_name = TABLE_TO_BQ_TABLE_NAME.get(short_name, short_name)
-            for rn in report_list:
-                report_to_table[rn.lower()] = bq_name
-
-        # Also allow user to mention the BQ table name directly in question
-        question_lower = question.lower()
-        resolved_table: Optional[str] = None
-
-        # Priority 1: exact BQ table name mentioned in question (most reliable)
-        for short_name, bq_name in TABLE_TO_BQ_TABLE_NAME.items():
-            if bq_name.lower() in question_lower or short_name in question_lower:
-                # Verify user has access via any report mapped to this table
-                for rn, tbl in report_to_table.items():
-                    if tbl == bq_name and rn in accessible_reports:
-                        resolved_table = bq_name
-                        break
-            if resolved_table:
-                break
-
-        # Priority 2: keyword overlap between question and accessible report names
-        if not resolved_table:
-            best_score = 0
-            for rn in accessible_reports:
-                tbl = report_to_table.get(rn)
-                if not tbl:
-                    continue
-                score = sum(1 for word in rn.split() if len(word) > 2 and word in question_lower)
-                if score > best_score:
-                    best_score = score
-                    resolved_table = tbl
-
-        # Priority 3: first accessible table as fallback
-        if not resolved_table:
-            for rn in sorted(accessible_reports):
-                tbl = report_to_table.get(rn)
-                if tbl:
-                    resolved_table = tbl
-                    break
-
-        if not resolved_table:
-            return {
-                "success": False,
-                "message": (
-                    "ไม่พบตารางที่ตรงกับคำถาม กรุณาใช้ list_available_tables "
-                    "เพื่อดูรายชื่อตารางทั้งหมดแล้วระบุชื่อตารางใน question ให้ชัดเจนขึ้น"
-                ),
-            }
-
-        # Safety: never query restricted tables
-        if resolved_table.lower() in _restricted_exact:
-            return {"success": False, "message": "ขออภัยครับ ตารางนี้เป็นข้อมูลระบบภายในที่ไม่อนุญาตให้เข้าถึงได้"}
-
-        table_ref = f"`{PROJECT_ID}.{target_dataset}.{resolved_table}`"
-
-        # ── Step 3: run a safe, read-only query (LIMIT 10) ───────
-        query = f"SELECT * FROM {table_ref} LIMIT 10"
-        job = bq_client.query(query)
-        result = job.result()
-        bytes_billed = job.total_bytes_billed or 0
-
-        schema_fields = [field.name for field in result.schema]
-        rows_raw = list(result)
-
-        if not rows_raw:
-            return {
-                "success": True,
-                "question": question,
-                "table_used": resolved_table,
-                "message": f"ไม่พบข้อมูลในตาราง '{resolved_table}'",
-                "data": [],
-                "row_count": 0,
-            }
-
-        # ── Step 4: rename columns to Thai via Firestore mapping ──
-        raw_mapping = get_table_column_mapping(f"{PROJECT_ID}.{target_dataset}.{resolved_table}")
-        lowercase_mapping = {k.lower(): v for k, v in raw_mapping.items()}
-
-        def _th(col: str) -> str:
-            return lowercase_mapping.get(col.lower(), col)
-
-        result_rows = []
-        for row in rows_raw:
-            record: dict = {}
-            for field_name in schema_fields:
-                val = row[field_name]
-                # Sanitise timezone-aware datetimes for JSON serialisation
-                if hasattr(val, "tzinfo") and val.tzinfo is not None:
-                    val = val.isoformat()
-                elif hasattr(val, "isoformat"):
-                    val = val.isoformat()
-                record[_th(field_name)] = val
-            result_rows.append(record)
-
-        return {
-            "success": True,
-            "question": question,
-            "table_used": resolved_table,
-            "dataset": target_dataset,
-            "row_count": len(result_rows),
-            "data": result_rows,
-            "bytes_billed": bytes_billed,
-            "note": (
-                "ข้อมูลด้านบนแสดง 10 แถวแรก (ชื่อคอลัมน์เป็นภาษาไทย) "
-                "หากต้องการยอดรวม/ค่าเฉลี่ย/จำนวนนับ กรุณาระบุใน question ให้ชัดเจนขึ้น "
-                "หรือใช้ generate_excel_report เพื่อดึงข้อมูลทั้งหมด"
-            ),
-        }
-
-    except Exception as e:
-        logger.error(f"[ask_data] Error: {e}", exc_info=True)
-        return {"success": False, "message": f"เกิดข้อผิดพลาดในการวิเคราะห์ข้อมูล: {str(e)}"}
 
 # ============================================================
-# SECTION 20 — REST API ENDPOINTS
+# SECTION 21 — REST API ENDPOINTS
 # ============================================================
-
 @app.post("/generate_excel_report")
 def generate_excel_report(request: GenerateReportRequest):
     res = _execute_report_generation(
@@ -1824,17 +1533,15 @@ def generate_excel_report(request: GenerateReportRequest):
         filters=request.filters, columns=request.columns,
         username=request.username, user_email=request.user_email,
         condition=request.condition or "AND",
-        send_email=request.send_email or False,
-        email_to=request.email_to,
     )
     if res["success"]:
         return {
             "success": True,
             "message": f"จัดเตรียม **รายงาน{res['report_name']}** สำเร็จ\n{res['download_url']}",
             "cost": res.get("cost"),
-            "email_sent": res.get("email_sent"),
         }
     return {"success": False, "message": res["message"]}
+
 
 @app.post("/generate_chart_report")
 def generate_chart_report(request: GenerateChartRequest):
@@ -1844,8 +1551,6 @@ def generate_chart_report(request: GenerateChartRequest):
         filters=request.filters, columns=request.columns,
         username=request.username, user_email=request.user_email,
         condition=request.condition or "AND",
-        send_email=request.send_email or False,
-        email_to=request.email_to,
     )
     if res["success"]:
         return {
@@ -1853,9 +1558,9 @@ def generate_chart_report(request: GenerateChartRequest):
             "message": f"จัดเตรียม **แผนภูมิของ{res['report_name']}** สำเร็จ\n{res['download_url']}",
             "download_url": res["download_url"],
             "cost": res.get("cost"),
-            "email_sent": res.get("email_sent"),
         }
     return {"success": False, "message": res["message"]}
+
 
 @app.post("/cost_estimate")
 def cost_estimate(req: CostEstimateRequest):
@@ -1866,48 +1571,64 @@ def cost_estimate(req: CostEstimateRequest):
     )
     return format_cost_breakdown(cost)
 
+
 @app.get("/download/{file_name}")
-def download_report(file_name: str, direct: bool = False):
-    if not DOWNLOAD_FILENAME_REGEX.match(file_name):
-        raise HTTPException(status_code=400, detail="รูปแบบลิงก์ไม่ถูกต้อง")
+async def download_file(
+    file_name: str,
+    direct: bool = False,
+    x_cleanup_token: Optional[str] = Header(None),
+    token: Optional[str] = None,
+    sc_report_session: Optional[str] = Cookie(None),
+):
+    if not _is_authenticated_for_files(x_cleanup_token, token, sc_report_session):
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
-    file_path = (REPORT_DIR / file_name).resolve()
-    if not file_path.is_relative_to(REPORT_DIR) or not file_path.exists():
-        raise HTTPException(status_code=404, detail="ไม่พบไฟล์หรือไม่มีสิทธิ์เข้าถึง")
+    safe_name = _safe_report_filename(file_name)
 
-    if direct:
-        media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        if file_name.endswith(".png"):
-            media_type = "image/png"
-        return FileResponse(path=file_path, filename=file_name, media_type=media_type)
+    if not direct:
+        return JSONResponse({
+            "success": True,
+            "file_name": safe_name,
+            "download_url": generate_gcs_signed_url(safe_name),
+            "expires_in_seconds": GCS_SIGNED_URL_TTL,
+        })
 
-    html_content = (
-        '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Downloading...</title></head><body><script>'
-        'const downloadUrl = window.location.pathname + "?direct=true";'
-        "const iframe = document.createElement('iframe');iframe.style.display = 'none';iframe.src = downloadUrl;"
-        "document.body.appendChild(iframe);setTimeout(() => { window.close(); }, 1000);</script></body></html>"
+    blob = get_gcs_blob(safe_name)
+    stream = blob.open("rb")
+
+    disposition = "inline" if safe_name.endswith(".png") else "attachment"
+
+    headers = {
+        "Content-Disposition": f'{disposition}; filename="{quote(safe_name)}"',
+        "X-Content-Type-Options": "nosniff",
+        "Cache-Control": "private, max-age=300",
+    }
+
+    return StreamingResponse(
+        stream,
+        media_type=get_gcs_content_type(safe_name),
+        headers=headers,
     )
-    return HTMLResponse(content=html_content)
+
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy"}
+    return {"status": "healthy", "storage": "gcs", "bucket": REPORT_BUCKET}
+
 
 # ============================================================
-# SECTION 21 — FILE MANAGER (FIX #2: session-based auth)
+# SECTION 22 — FILE MANAGER  (ใช้ GCS)
 # ============================================================
 @app.post("/files/login")
 async def files_login(
     x_cleanup_token: Optional[str] = Header(None),
     token: Optional[str] = None,
 ):
-    """✅ FIX #2: Login เข้า file manager"""
     if not CLEANUP_SECRET:
-        # ⚠️ bypass ถ้าไม่ตั้ง secret (พฤติกรรมเดิม) — secure=True เสมอ
         response = JSONResponse({"success": True, "message": "Logged in (no auth required)"})
         response.set_cookie(
             key=SESSION_COOKIE_NAME, value="no-auth",
-            max_age=SESSION_MAX_AGE, httponly=True, secure=True, samesite="strict",
+            max_age=SESSION_MAX_AGE, httponly=True, secure=False, samesite="strict",
         )
         return response
 
@@ -1922,14 +1643,15 @@ async def files_login(
     )
     return response
 
+
 @app.post("/files/logout")
 async def files_logout():
     response = JSONResponse({"success": True, "message": "Logged out"})
     response.delete_cookie(SESSION_COOKIE_NAME)
     return response
 
+
 def _render_login_page():
-    """✅ FIX #2: หน้า login แยก — ไม่มี secret ใน HTML"""
     return """<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Login - SC Report</title>
 <style>
@@ -1971,6 +1693,7 @@ document.getElementById('tokenInput').addEventListener('keypress', (e) => {
 });
 </script></body></html>"""
 
+
 @app.get("/files")
 @app.get("/file")
 def list_files(
@@ -1980,7 +1703,6 @@ def list_files(
     format: Optional[str] = None,
     sc_report_session: Optional[str] = Cookie(None),
 ):
-    """✅ FIX #2: รองรับ 3 วิธี auth"""
     if not _is_authenticated_for_files(x_cleanup_token, token, sc_report_session):
         accept = request.headers.get("accept", "")
         if "text/html" in accept:
@@ -1988,26 +1710,16 @@ def list_files(
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
-        files = []
-        total_size_bytes = 0
-        for file_path in REPORT_DIR.glob("*"):
-            if file_path.is_file():
-                stat = file_path.stat()
-                total_size_bytes += stat.st_size
-                files.append({
-                    "name": file_path.name,
-                    "size_bytes": stat.st_size,
-                    "size_mb": round(stat.st_size / (1024 * 1024), 4),
-                    "created_at": datetime.fromtimestamp(stat.st_ctime).isoformat(),
-                    "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(),
-                })
-
-        files = sorted(files, key=lambda x: x["modified_at"], reverse=True)
+        files = list_gcs_files()   # ← GCS
+        total_size_bytes = sum(f["size_bytes"] for f in files)
 
         if format == "json" or "text/html" not in request.headers.get("accept", ""):
-            return {"directory": str(REPORT_DIR), "files": files}
+            return {
+                "bucket": REPORT_BUCKET,
+                "prefix": GCS_REPORT_PREFIX,
+                "files": files,
+            }
 
-        # ✅ FIX #2: ลบ token_query ออก — ใช้ cookie
         html_template = f"""<!DOCTYPE html>
 <html lang="th">
 <head>
@@ -2017,229 +1729,253 @@ def list_files(
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=Sarabun:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {{
-            --bg-color: #0d1117;
-            --card-bg: rgba(22, 27, 34, 0.7);
-            --border-color: rgba(48, 54, 61, 0.8);
-            --text-main: #f0f6fc;
-            --text-muted: #8b949e;
-            --accent-blue: #58a6ff;
-            --accent-green: #3fb950;
-            --accent-orange: #f0883e;
-            --accent-red: #ff7b72;
-            --glass-blur: blur(12px);
+            --bg-color: #0d1117; --card-bg: rgba(22,27,34,0.7); --border-color: rgba(48,54,61,0.8);
+            --text-main: #f0f6fc; --text-muted: #8b949e; --accent-blue: #58a6ff;
+            --accent-green: #3fb950; --accent-red: #ff7b72; --glass-blur: blur(12px);
         }}
         * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-        body {{
-            background-color: var(--bg-color);
-            color: var(--text-main);
-            font-family: 'Outfit', 'Sarabun', -apple-system, BlinkMacSystemFont, sans-serif;
-            min-height: 100vh;
-            background-image: radial-gradient(circle at 10% 20%, rgba(90, 120, 250, 0.05) 0%, transparent 40%),
-                              radial-gradient(circle at 90% 80%, rgba(250, 100, 100, 0.03) 0%, transparent 40%);
-            background-attachment: fixed;
-            padding: 2rem 1.5rem;
-        }}
+        body {{ background-color: var(--bg-color); color: var(--text-main);
+                font-family: 'Outfit','Sarabun',sans-serif; min-height: 100vh;
+                background-image: radial-gradient(circle at 10% 20%, rgba(90,120,250,0.05) 0%, transparent 40%),
+                                  radial-gradient(circle at 90% 80%, rgba(250,100,100,0.03) 0%, transparent 40%);
+                background-attachment: fixed; padding: 2rem 1.5rem; }}
         .container {{ max-width: 1200px; margin: 0 auto; }}
-        header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; flex-wrap: wrap; gap: 1rem; }}
-        .title-area h1 {{ font-size: 2rem; font-weight: 700; background: linear-gradient(135deg, #fff 0%, #8b949e 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; display: flex; align-items: center; gap: 0.5rem; }}
+        header {{ display: flex; justify-content: space-between; align-items: center;
+                  margin-bottom: 2rem; flex-wrap: wrap; gap: 1rem; }}
+        .title-area h1 {{ font-size: 2rem; font-weight: 700;
+                          background: linear-gradient(135deg, #fff 0%, #8b949e 100%);
+                          -webkit-background-clip: text; -webkit-text-fill-color: transparent; }}
         .title-area p {{ color: var(--text-muted); margin-top: 0.25rem; font-size: 0.9rem; }}
         .stats-bar {{ display: flex; gap: 1.5rem; }}
-        .stat-card {{ background: var(--card-bg); border: 1px solid var(--border-color); backdrop-filter: var(--glass-blur); border-radius: 12px; padding: 0.75rem 1.25rem; display: flex; flex-direction: column; }}
+        .stat-card {{ background: var(--card-bg); border: 1px solid var(--border-color);
+                      backdrop-filter: var(--glass-blur); border-radius: 12px; padding: 0.75rem 1.25rem;
+                      display: flex; flex-direction: column; }}
         .stat-card .value {{ font-size: 1.4rem; font-weight: 600; color: var(--accent-blue); }}
-        .stat-card .label {{ font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); margin-top: 0.15rem; }}
-        .toolbar {{ background: var(--card-bg); border: 1px solid var(--border-color); backdrop-filter: var(--glass-blur); border-radius: 16px; padding: 1rem; margin-bottom: 1.5rem; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1rem; }}
+        .stat-card .label {{ font-size: 0.75rem; text-transform: uppercase;
+                             letter-spacing: 0.05em; color: var(--text-muted); margin-top: 0.15rem; }}
+        .toolbar {{ background: var(--card-bg); border: 1px solid var(--border-color);
+                    backdrop-filter: var(--glass-blur); border-radius: 16px; padding: 1rem;
+                    margin-bottom: 1.5rem; display: flex; justify-content: space-between;
+                    align-items: center; flex-wrap: wrap; gap: 1rem; }}
         .search-wrapper {{ position: relative; flex: 1; max-width: 400px; }}
-        .search-input {{ width: 100%; background: rgba(13, 17, 23, 0.8); border: 1px solid var(--border-color); border-radius: 8px; padding: 0.6rem 1rem 0.6rem 2.5rem; color: var(--text-main); font-family: inherit; font-size: 0.95rem; transition: all 0.2s ease; }}
-        .search-input:focus {{ outline: none; border-color: var(--accent-blue); box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.15); }}
-        .search-icon {{ position: absolute; left: 0.8rem; top: 50%; transform: translateY(-50%); fill: var(--text-muted); width: 18px; height: 18px; pointer-events: none; }}
-        .btn {{ background: var(--accent-blue); color: #0d1117; border: none; border-radius: 8px; padding: 0.6rem 1.2rem; font-weight: 600; font-size: 0.9rem; cursor: pointer; transition: all 0.2s ease; display: inline-flex; align-items: center; gap: 0.5rem; font-family: inherit; }}
+        .search-input {{ width: 100%; background: rgba(13,17,23,0.8); border: 1px solid var(--border-color);
+                         border-radius: 8px; padding: 0.6rem 1rem 0.6rem 2.5rem; color: var(--text-main);
+                         font-family: inherit; font-size: 0.95rem; transition: all 0.2s; }}
+        .search-input:focus {{ outline: none; border-color: var(--accent-blue); box-shadow: 0 0 0 3px rgba(88,166,255,0.15); }}
+        .search-icon {{ position: absolute; left: 0.8rem; top: 50%; transform: translateY(-50%);
+                        fill: var(--text-muted); width: 18px; height: 18px; pointer-events: none; }}
+        .btn {{ background: var(--accent-blue); color: #0d1117; border: none; border-radius: 8px;
+                padding: 0.6rem 1.2rem; font-weight: 600; font-size: 0.9rem; cursor: pointer;
+                transition: all 0.2s; display: inline-flex; align-items: center; gap: 0.5rem; font-family: inherit; }}
         .btn:hover {{ opacity: 0.9; transform: translateY(-1px); }}
         .btn-outline {{ background: transparent; border: 1px solid var(--border-color); color: var(--text-main); }}
-        .btn-outline:hover {{ background: rgba(255, 255, 255, 0.05); border-color: var(--text-muted); }}
-        .btn-danger {{ background: rgba(255, 123, 114, 0.15); border: 1px solid rgba(255, 123, 114, 0.4); color: var(--accent-red); }}
+        .btn-outline:hover {{ background: rgba(255,255,255,0.05); }}
+        .btn-danger {{ background: rgba(255,123,114,0.15); border: 1px solid rgba(255,123,114,0.4);
+                       color: var(--accent-red); }}
         .btn-danger:hover {{ background: var(--accent-red); color: #0d1117; border-color: var(--accent-red); }}
-        .file-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 1.25rem; }}
-        .file-card {{ background: var(--card-bg); border: 1px solid var(--border-color); border-radius: 16px; padding: 1.25rem; display: flex; flex-direction: column; justify-content: space-between; transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1); position: relative; overflow: hidden; }}
-        .file-card:hover {{ transform: translateY(-4px); border-color: var(--accent-blue); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3); }}
+        .file-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(280px,1fr)); gap: 1.25rem; }}
+        .file-card {{ background: var(--card-bg); border: 1px solid var(--border-color); border-radius: 16px;
+                      padding: 1.25rem; display: flex; flex-direction: column; justify-content: space-between;
+                      transition: all 0.25s cubic-bezier(0.4,0,0.2,1); }}
+        .file-card:hover {{ transform: translateY(-4px); border-color: var(--accent-blue);
+                            box-shadow: 0 8px 24px rgba(0,0,0,0.3); }}
         .file-header {{ display: flex; align-items: flex-start; gap: 0.75rem; margin-bottom: 1rem; }}
-        .file-icon {{ width: 44px; height: 44px; background: rgba(255, 255, 255, 0.03); border-radius: 10px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; border: 1px solid rgba(255, 255, 255, 0.05); }}
-        .icon-xlsx {{ color: var(--accent-green); background: rgba(63, 185, 80, 0.08); border-color: rgba(63, 185, 80, 0.15); }}
-        .icon-png {{ color: var(--accent-blue); background: rgba(88, 166, 255, 0.08); border-color: rgba(88, 166, 255, 0.15); }}
+        .file-icon {{ width: 44px; height: 44px; border-radius: 10px; display: flex;
+                      align-items: center; justify-content: center; flex-shrink: 0;
+                      border: 1px solid rgba(255,255,255,0.05); }}
+        .icon-xlsx {{ color: var(--accent-green); background: rgba(63,185,80,0.08);
+                      border-color: rgba(63,185,80,0.15); }}
+        .icon-png {{ color: var(--accent-blue); background: rgba(88,166,255,0.08);
+                     border-color: rgba(88,166,255,0.15); }}
         .file-info {{ min-width: 0; }}
-        .file-name {{ font-size: 0.95rem; font-weight: 600; margin-bottom: 0.25rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text-main); }}
-        .file-meta {{ font-size: 0.75rem; color: var(--text-muted); display: flex; flex-direction: column; gap: 0.15rem; }}
-        .thumbnail-container {{ width: 100%; height: 140px; border-radius: 10px; background: #07090e; overflow: hidden; margin-bottom: 1rem; border: 1px solid rgba(255, 255, 255, 0.05); display: flex; align-items: center; justify-content: center; cursor: zoom-in; }}
+        .file-name {{ font-size: 0.95rem; font-weight: 600; margin-bottom: 0.25rem;
+                      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+        .file-meta {{ font-size: 0.75rem; color: var(--text-muted); display: flex;
+                      flex-direction: column; gap: 0.15rem; }}
+        .thumbnail-container {{ width: 100%; height: 140px; border-radius: 10px; background: #07090e;
+                                 overflow: hidden; margin-bottom: 1rem;
+                                 border: 1px solid rgba(255,255,255,0.05);
+                                 display: flex; align-items: center; justify-content: center; cursor: zoom-in; }}
         .thumbnail-img {{ max-width: 100%; max-height: 100%; object-fit: contain; transition: transform 0.2s; }}
         .thumbnail-container:hover .thumbnail-img {{ transform: scale(1.05); }}
         .file-actions {{ display: flex; gap: 0.5rem; margin-top: auto; }}
-        .action-btn {{ flex: 1; padding: 0.5rem; border-radius: 8px; font-size: 0.85rem; font-weight: 500; text-decoration: none; text-align: center; transition: all 0.2s; cursor: pointer; border: 1px solid transparent; }}
-        .btn-view {{ background: rgba(88, 166, 255, 0.1); color: var(--accent-blue); border-color: rgba(88, 166, 255, 0.2); }}
+        .action-btn {{ flex: 1; padding: 0.5rem; border-radius: 8px; font-size: 0.85rem; font-weight: 500;
+                       text-decoration: none; text-align: center; transition: all 0.2s; cursor: pointer;
+                       border: 1px solid transparent; }}
+        .btn-view {{ background: rgba(88,166,255,0.1); color: var(--accent-blue); border-color: rgba(88,166,255,0.2); }}
         .btn-view:hover {{ background: var(--accent-blue); color: #0d1117; }}
         .btn-download {{ background: var(--accent-blue); color: #0d1117; font-weight: 600; }}
         .btn-download:hover {{ opacity: 0.9; }}
-        .btn-delete {{ background: rgba(255, 123, 114, 0.1); color: var(--accent-red); border-color: rgba(255, 123, 114, 0.2); }}
-        .btn-delete:hover {{ background: var(--accent-red); color: #0d1117; border-color: var(--accent-red); }}
-        .empty-state {{ background: var(--card-bg); border: 2px dashed var(--border-color); border-radius: 20px; padding: 4rem 2rem; text-align: center; color: var(--text-muted); grid-column: 1 / -1; }}
+        .btn-delete {{ background: rgba(255,123,114,0.1); color: var(--accent-red); border-color: rgba(255,123,114,0.2); }}
+        .btn-delete:hover {{ background: var(--accent-red); color: #0d1117; }}
+        .empty-state {{ background: var(--card-bg); border: 2px dashed var(--border-color); border-radius: 20px;
+                        padding: 4rem 2rem; text-align: center; color: var(--text-muted); grid-column: 1 / -1; }}
         .empty-state h3 {{ color: var(--text-main); font-size: 1.3rem; margin-bottom: 0.5rem; }}
-        .modal {{ display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(13, 17, 23, 0.9); backdrop-filter: blur(8px); align-items: center; justify-content: center; }}
-        .modal-content {{ max-width: 90%; max-height: 85%; box-shadow: 0 24px 48px rgba(0, 0, 0, 0.5); border-radius: 12px; border: 1px solid var(--border-color); background: #0d1117; overflow: hidden; display: flex; flex-direction: column; }}
+        .modal {{ display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%;
+                  background: rgba(13,17,23,0.9); backdrop-filter: blur(8px);
+                  align-items: center; justify-content: center; }}
+        .modal-content {{ max-width: 90%; max-height: 85%; box-shadow: 0 24px 48px rgba(0,0,0,0.5);
+                          border-radius: 12px; border: 1px solid var(--border-color); background: #0d1117;
+                          overflow: hidden; display: flex; flex-direction: column; }}
         .modal-body {{ padding: 1rem; display: flex; justify-content: center; align-items: center; }}
         .modal-body img {{ max-width: 100%; max-height: 70vh; object-fit: contain; }}
-        .modal-header {{ display: flex; justify-content: space-between; align-items: center; padding: 1rem 1.5rem; border-bottom: 1px solid var(--border-color); }}
+        .modal-header {{ display: flex; justify-content: space-between; align-items: center;
+                         padding: 1rem 1.5rem; border-bottom: 1px solid var(--border-color); }}
         .modal-title {{ font-size: 1.1rem; font-weight: 600; }}
-        .close-btn {{ color: var(--text-muted); font-size: 28px; font-weight: bold; cursor: pointer; transition: color 0.2s; }}
+        .close-btn {{ color: var(--text-muted); font-size: 28px; font-weight: bold; cursor: pointer; }}
         .close-btn:hover {{ color: var(--text-main); }}
+        .gcs-badge {{ background: rgba(88,166,255,0.1); border: 1px solid rgba(88,166,255,0.25);
+                      color: var(--accent-blue); border-radius: 6px; padding: 0.2rem 0.6rem;
+                      font-size: 0.75rem; font-weight: 600; }}
     </style>
 </head>
 <body>
-    <div class="container">
-        <header>
-            <div class="title-area">
-                <h1>📁 File Manager</h1>
-                <p>จัดการไฟล์เอกสารรายงานและกราฟแดชบอร์ดที่ถูกสร้างขึ้น</p>
+<div class="container">
+    <header>
+        <div class="title-area">
+            <h1>📁 File Manager <span class="gcs-badge">☁️ GCS</span></h1>
+            <p>gs://{REPORT_BUCKET}/{GCS_REPORT_PREFIX} — จัดการไฟล์รายงานและกราฟแดชบอร์ด</p>
+        </div>
+        <div class="stats-bar">
+            <div class="stat-card">
+                <span class="value">{len(files)}</span>
+                <span class="label">จำนวนไฟล์ทั้งหมด</span>
             </div>
-            <div class="stats-bar">
-                <div class="stat-card">
-                    <span class="value">{len(files)}</span>
-                    <span class="label">จำนวนไฟล์ทั้งหมด</span>
-                </div>
-                <div class="stat-card">
-                    <span class="value">{round(total_size_bytes / (1024 * 1024), 2)} MB</span>
-                    <span class="label">ขนาดรวมทั้งหมด</span>
-                </div>
-            </div>
-        </header>
-        <div class="toolbar">
-            <div class="search-wrapper">
-                <svg class="search-icon" viewBox="0 0 16 16"><path d="M10.68 11.74a6 6 0 0 1-8.322-8.322 6 6 0 0 1 8.322 8.322Zm1.06-1.06A7.5 7.5 0 1 0 2.22 2.22a7.5 7.5 0 0 0 10.56 10.56L15 15.28a.749.749 0 0 0 1.06-1.06l-4.32-4.32Z"></path></svg>
-                <input type="text" id="searchInput" class="search-input" placeholder="ค้นหาชื่อไฟล์..." onkeyup="filterFiles()">
-            </div>
-            <div style="display: flex; gap: 0.5rem;">
-                <button class="btn btn-outline" onclick="window.location.reload()">🔄 รีเฟรช</button>
-                <button class="btn btn-danger" onclick="triggerCleanup()">🧹 เคลียร์ไฟล์ขยะ</button>
+            <div class="stat-card">
+                <span class="value">{round(total_size_bytes / (1024*1024), 2)} MB</span>
+                <span class="label">ขนาดรวมทั้งหมด</span>
             </div>
         </div>
-        <div class="file-grid" id="fileGrid">
-        """
+    </header>
+    <div class="toolbar">
+        <div class="search-wrapper">
+            <svg class="search-icon" viewBox="0 0 16 16"><path d="M10.68 11.74a6 6 0 0 1-8.322-8.322 6 6 0 0 1 8.322 8.322Zm1.06-1.06A7.5 7.5 0 1 0 2.22 2.22a7.5 7.5 0 0 0 10.56 10.56L15 15.28a.749.749 0 0 0 1.06-1.06l-4.32-4.32Z"></path></svg>
+            <input type="text" id="searchInput" class="search-input" placeholder="ค้นหาชื่อไฟล์..." onkeyup="filterFiles()">
+        </div>
+        <div style="display:flex;gap:0.5rem;">
+            <button class="btn btn-outline" onclick="window.location.reload()">🔄 รีเฟรช</button>
+            <button class="btn btn-danger" onclick="triggerCleanup()">🧹 เคลียร์ไฟล์ขยะ</button>
+        </div>
+    </div>
+    <div class="file-grid" id="fileGrid">
+"""
 
         if not files:
             html_template += """
-            <div class="empty-state">
-                <h3>ไม่พบไฟล์ในระบบ</h3>
-                <p>ยังไม่มีไฟล์รายงานหรือกราฟบันทึกไว้ในขณะนี้</p>
-            </div>
-            """
+        <div class="empty-state">
+            <h3>ไม่พบไฟล์ใน GCS Bucket</h3>
+            <p>ยังไม่มีไฟล์รายงานหรือกราฟบันทึกไว้ใน bucket นี้</p>
+        </div>
+"""
         else:
             for f in files:
-                name = f["name"]
+                name = _safe_report_filename(f["name"])
+                name_html = html.escape(name, quote=True)
+                name_attr = html.escape(name.lower(), quote=True)
+                name_js = json.dumps(name)
+
+                download_path = f"/download/{quote(name)}?direct=true"
+                download_path_html = html.escape(download_path, quote=True)
+
                 size_mb = f["size_mb"]
-                created = datetime.fromisoformat(f["created_at"]).strftime("%Y-%m-%d %H:%M:%S")
+                raw_mod = f["modified_at"]
+                try:
+                    mod_display = datetime.fromisoformat(raw_mod).strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    mod_display = raw_mod
                 is_img = name.endswith(".png")
                 icon_cls = "icon-png" if is_img else "icon-xlsx"
-                icon_svg = '<svg viewBox="0 0 16 16" width="20" height="20" fill="currentColor"><path d="M2.002 1a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V3a2 2 0 0 0-2-2h-12zm12 1a1 1 0 0 1 1 1v6.5l-3.777-1.947a.5.5 0 0 0-.577.093l-3.71 3.71-2.66-1.772a.5.5 0 0 0-.63.062L1.002 12V3a1 1 0 0 1 1-1h12z"/><path d="M10.5 7a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3z"/></svg>' if is_img else '<svg viewBox="0 0 16 16" width="20" height="20" fill="currentColor"><path d="M14 14V4.5L9.5 0H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2zM9.5 1.5 13 5h-3.5V1.5zM3 9h10v1H3V9zm0 2h10v1H3v-1zm0 2h7v1H3v-1z"/></svg>'
-
+                icon_svg = (
+                    '<svg viewBox="0 0 16 16" width="20" height="20" fill="currentColor">'
+                    '<path d="M2.002 1a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V3a2 2 0 0 0-2-2h-12zm12 1a1 1 0 0 1 1 1v6.5l-3.777-1.947a.5.5 0 0 0-.577.093l-3.71 3.71-2.66-1.772a.5.5 0 0 0-.63.062L1.002 12V3a1 1 0 0 1 1-1h12z"/>'
+                    '<path d="M10.5 7a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3z"/></svg>'
+                    if is_img else
+                    '<svg viewBox="0 0 16 16" width="20" height="20" fill="currentColor">'
+                    '<path d="M14 14V4.5L9.5 0H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2zM9.5 1.5 13 5h-3.5V1.5zM3 9h10v1H3V9zm0 2h10v1H3v-1zm0 2h7v1H3v-1z"/></svg>'
+                )
                 html_template += f"""
-                <div class="file-card" data-name="{name.lower()}">
-                    <div class="file-header">
-                        <div class="file-icon {icon_cls}">{icon_svg}</div>
-                        <div class="file-info">
-                            <div class="file-name" title="{name}">{name}</div>
-                            <div class="file-meta">
-                                <span>ขนาด: {size_mb:.4f} MB</span>
-                                <span>แก้ไขล่าสุด: {created}</span>
-                            </div>
-                        </div>
-                    </div>
-                """
-                if is_img:
-                    html_template += f"""
-                    <div class="thumbnail-container" onclick="openPreview('/download/{name}?direct=true', '{name}')">
-                        <img class="thumbnail-img" src="/download/{name}?direct=true" alt="{name}">
-                    </div>
-                    """
-                html_template += f"""
-                    <div class="file-actions">
-                """
-                if is_img:
-                    html_template += f"""<button class="action-btn btn-view" onclick="openPreview('/download/{name}?direct=true', '{name}')">👁️ ดูภาพ</button>"""
-                else:
-                    html_template += f"""<a class="action-btn btn-view" href="/download/{name}?direct=true" target="_blank">👁️ ดูข้อมูล</a>"""
-                html_template += f"""
-                        <a class="action-btn btn-download" href="/download/{name}?direct=true" download>📥 ดาวน์โหลด</a>
-                        <button class="action-btn btn-delete" onclick="deleteFile('{name}')">🗑️ ลบ</button>
+        <div class="file-card" data-name="{name_attr}">
+            <div class="file-header">
+                <div class="file-icon {icon_cls}">{icon_svg}</div>
+                <div class="file-info">
+                    <div class="file-name" title="{name_html}">{name_html}</div>
+                    <div class="file-meta">
+                        <span>ขนาด: {size_mb:.4f} MB</span>
+                        <span>แก้ไขล่าสุด: {mod_display}</span>
                     </div>
                 </div>
-                """
+            </div>
+"""
+                if is_img:
+                    html_template += f"""
+            <div class="thumbnail-container" onclick="openPreview('{download_path_html}', {name_js})">
+                <img class="thumbnail-img" src="{download_path_html}" alt="{name_html}">
+            </div>
+"""
+                html_template += f"""
+            <div class="file-actions">
+"""
+                if is_img:
+                    html_template += f"""<button class="action-btn btn-view" onclick="openPreview('{download_path_html}', {name_js})">👁️ ดูภาพ</button>"""
+                else:
+                    html_template += f"""<a class="action-btn btn-view" href="{download_path_html}" target="_blank" rel="noopener noreferrer">👁️ ดูข้อมูล</a>"""
+                html_template += f"""
+                <a class="action-btn btn-download" href="{download_path_html}" download>📥 ดาวน์โหลด</a>
+                <button class="action-btn btn-delete" onclick="deleteFile({name_js})">🗑️ ลบ</button>
+            </div>
+        </div>
+"""
 
         html_template += """
-        </div>
     </div>
-    <div id="previewModal" class="modal" onclick="closePreview()">
-        <div class="modal-content" onclick="event.stopPropagation()">
-            <div class="modal-header">
-                <span class="modal-title" id="modalTitle">ดูตัวอย่างภาพ</span>
-                <span class="close-btn" onclick="closePreview()">&times;</span>
-            </div>
-            <div class="modal-body"><img id="modalImg" src="" alt="Preview"></div>
+</div>
+<div id="previewModal" class="modal" onclick="closePreview()">
+    <div class="modal-content" onclick="event.stopPropagation()">
+        <div class="modal-header">
+            <span class="modal-title" id="modalTitle">ดูตัวอย่างภาพ</span>
+            <span class="close-btn" onclick="closePreview()">&times;</span>
         </div>
+        <div class="modal-body"><img id="modalImg" src="" alt="Preview"></div>
     </div>
-    <script>
-        function filterFiles() {
-            const query = document.getElementById('searchInput').value.toLowerCase();
-            const cards = document.getElementsByClassName('file-card');
-            for (let card of cards) {
-                card.style.display = card.getAttribute('data-name').includes(query) ? 'flex' : 'none';
-            }
+</div>
+<script>
+    function filterFiles() {
+        const q = document.getElementById('searchInput').value.toLowerCase();
+        for (const card of document.getElementsByClassName('file-card')) {
+            card.style.display = card.getAttribute('data-name').includes(q) ? 'flex' : 'none';
         }
-        function openPreview(src, title) {
-            document.getElementById('modalImg').src = src;
-            document.getElementById('modalTitle').textContent = title;
-            document.getElementById('previewModal').style.display = 'flex';
-        }
-        async function deleteFile(fileName) {
-            if (!confirm(`คุณแน่ใจหรือไม่ว่าต้องการลบไฟล์ "${fileName}"?`)) return;
-            try {
-                const res = await fetch(`/files/${encodeURIComponent(fileName)}`, {
-                    method: 'DELETE',
-                    credentials: 'include'
-                });
-                const data = await res.json();
-                if (res.ok && data.success) {
-                    alert('ลบไฟล์เรียบร้อยแล้ว!');
-                    window.location.reload();
-                } else if (res.status === 401) {
-                    alert('Session หมดอายุ กรุณา login ใหม่');
-                    window.location.href = '/files';
-                } else {
-                    alert('เกิดข้อผิดพลาด: ' + (data.detail || data.message));
-                }
-            } catch (err) {
-                alert('เกิดข้อผิดพลาดในการเชื่อมต่อเซิร์ฟเวอร์: ' + err.message);
-            }
-        }
-        function closePreview() {
-            document.getElementById('previewModal').style.display = 'none';
-        }
-        async function triggerCleanup() {
-            if (!confirm('คุณแน่ใจหรือไม่ว่าต้องการสั่งล้างไฟล์ขยะและไฟล์เก่าทั้งหมดในระบบ?')) return;
-            try {
-                const res = await fetch('/internal/cleanup', {
-                    method: 'POST',
-                    credentials: 'include'
-                });
-                const data = await res.json();
-                if (data.success) { alert('ล้างไฟล์ขยะเรียบร้อยแล้ว!'); window.location.reload(); }
-                else if (res.status === 401) {
-                    alert('Session หมดอายุ กรุณา login ใหม่');
-                    window.location.href = '/files';
-                } else {
-                    alert('เกิดข้อผิดพลาด: ' + data.message);
-                }
-            } catch (err) {
-                alert('เกิดข้อผิดพลาดในการเชื่อมต่อเซิร์ฟเวอร์: ' + err.message);
-            }
-        }
-    </script>
+    }
+    function openPreview(src, title) {
+        document.getElementById('modalImg').src = src;
+        document.getElementById('modalTitle').textContent = title;
+        document.getElementById('previewModal').style.display = 'flex';
+    }
+    function closePreview() {
+        document.getElementById('previewModal').style.display = 'none';
+    }
+    async function deleteFile(fileName) {
+        if (!confirm(`คุณแน่ใจหรือไม่ว่าต้องการลบไฟล์ "${fileName}"?`)) return;
+        try {
+            const res = await fetch(`/files/${encodeURIComponent(fileName)}`, {
+                method: 'DELETE', credentials: 'include'
+            });
+            const data = await res.json();
+            if (res.ok && data.success) { alert('ลบไฟล์เรียบร้อยแล้ว!'); window.location.reload(); }
+            else if (res.status === 401) { alert('Session หมดอายุ'); window.location.href = '/files'; }
+            else { alert('เกิดข้อผิดพลาด: ' + (data.detail || data.message)); }
+        } catch (err) { alert('เกิดข้อผิดพลาด: ' + err.message); }
+    }
+    async function triggerCleanup() {
+        if (!confirm('คุณแน่ใจหรือไม่ว่าต้องการสั่งล้างไฟล์ขยะทั้งหมด?')) return;
+        try {
+            const res = await fetch('/internal/cleanup', { method: 'POST', credentials: 'include' });
+            const data = await res.json();
+            if (data.success) { alert('ล้างไฟล์ขยะเรียบร้อยแล้ว!'); window.location.reload(); }
+            else if (res.status === 401) { alert('Session หมดอายุ'); window.location.href = '/files'; }
+            else { alert('เกิดข้อผิดพลาด: ' + data.message); }
+        } catch (err) { alert('เกิดข้อผิดพลาด: ' + err.message); }
+    }
+</script>
 </body>
 </html>
 """
@@ -2250,6 +1986,7 @@ def list_files(
         logger.error(f"Error listing files: {e}", exc_info=True)
         return {"success": False, "message": f"Failed to list files: {str(e)}"}
 
+
 @app.delete("/files/{file_name}")
 async def delete_file(
     file_name: str,
@@ -2257,42 +1994,33 @@ async def delete_file(
     token: Optional[str] = None,
     sc_report_session: Optional[str] = Cookie(None),
 ):
-    """✅ FIX #2: รองรับ cookie auth"""
     if not _is_authenticated_for_files(x_cleanup_token, token, sc_report_session):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    if not DOWNLOAD_FILENAME_REGEX.match(file_name):
-        raise HTTPException(status_code=400, detail="รูปแบบชื่อไฟล์ไม่ถูกต้อง")
+    safe_name = _safe_report_filename(file_name)
+    delete_gcs_file(safe_name)
 
-    file_path = (REPORT_DIR / file_name).resolve()
-    if not file_path.is_relative_to(REPORT_DIR):
-        raise HTTPException(status_code=403, detail="ไม่มีสิทธิ์เข้าถึง")
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="ไม่พบไฟล์")
+    return {
+        "success": True,
+        "message": f"ลบไฟล์ {safe_name} เรียบร้อยแล้ว",
+    }
 
-    try:
-        file_path.unlink()
-        logger.info(f"Deleted file: {file_name}")
-        return {"success": True, "message": f"ลบไฟล์ {file_name} เรียบร้อยแล้ว"}
-    except Exception as e:
-        logger.error(f"Failed to delete {file_name}: {e}")
-        raise HTTPException(status_code=500, detail=f"ลบไฟล์ไม่สำเร็จ: {str(e)}")
 
 @app.post("/internal/cleanup")
 async def trigger_cleanup(
     x_cleanup_token: Optional[str] = Header(None),
     sc_report_session: Optional[str] = Cookie(None),
 ):
-    """✅ FIX #2: รองรับ cookie auth"""
     if CLEANUP_SECRET:
         if not _is_authenticated_for_files(x_cleanup_token, None, sc_report_session):
             raise HTTPException(status_code=401, detail="Unauthorized")
     logger.info("Triggering manual report cleanup via API...")
-    await asyncio.to_thread(cleanup_old_reports)
-    return {"success": True, "message": "Cleanup completed successfully"}
+    deleted = await asyncio.to_thread(cleanup_gcs_files)
+    return {"success": True, "message": f"Cleanup completed — {deleted} file(s) removed."}
+
 
 # ============================================================
-# SECTION 22 — MOUNT MCP & ENTRYPOINT
+# SECTION 23 — MOUNT MCP & ENTRYPOINT
 # ============================================================
 app.mount("", mcp_asgi_app)
 
